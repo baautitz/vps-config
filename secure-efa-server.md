@@ -10,8 +10,8 @@ e deixa o firewall pronto para coexistir com o Docker sem o UFW atrapalhar.
 |---|---|---|
 | SSH | Força chave pública, desativa senha, libera apenas `root`. | `Port 22`, `PermitRootLogin prohibit-password`, `PasswordAuthentication no` |
 | Fail2Ban | Banir 1 h após 3 falhas em 10 min. | Jail `sshd` ativo, usando `iptables-multiport` |
-| iptables host | Input padrão `DROP`, abre apenas TCP 22, 80 e 443. | Chains `INPUT`/`FORWARD`/`OUTPUT` em `/etc/iptables/secure-efa-host.v{4,6}` |
-| iptables Docker | `DOCKER-USER` salta para `EFA-DOCKER`, que libera só 80 e 443 por padrão. | Chains `EFA-DOCKER`/`EFA-DOCKER-ALLOW` em `/etc/iptables/secure-efa-docker.v{4,6}` |
+| iptables host | Input padrão `DROP`, abre TCP 22, 80 e 443 por padrão. | Chains `INPUT`/`FORWARD`/`OUTPUT` em `/etc/iptables/secure-efa-host.v{4,6}` |
+| iptables Docker | `DOCKER-USER` salta para `EFA-DOCKER`, que libera TCP 80/443 por padrão e bloqueia outras portas publicadas sem `open-port`. | Chains `EFA-DOCKER`/`EFA-DOCKER-ALLOW` em `/etc/iptables/secure-efa-docker.v{4,6}` |
 | UFW | Removido por padrão. | O pacote `ufw` é purgado (não apenas desativado) |
 
 Docker continua dono de `NAT`, `DOCKER`, `DOCKER-BRIDGE`, etc. O script só
@@ -27,19 +27,20 @@ políticas do host em cima do Docker.
 - Nenhum dos seguintes em uso: `firewalld`, `nftables.service`,
   Docker com `"iptables": false` ou backend `"nftables"`.
 - Conexão com a internet para `apt-get install` (caso `openssh-server`,
-  `fail2ban`, `python3-systemd` ou `iptables` ainda não estejam instalados).
+  `fail2ban`, `python3-systemd`, `iptables` ou `conntrack` ainda não estejam
+  instalados).
 
 > O script aborta com mensagem clara se algum desses pré-requisitos falhar.
 
 ## Como rodar
 
 ````bash
-sudo ./secure-efa-server.sh
-# ou, para ver ajuda:
+sudo ./secure-efa-server.sh install
+# Para ver ajuda (também é o comportamento sem subcomando):
 sudo ./secure-efa-server.sh --help
 ````
 
-A execução é idempotente: pode rodar de novo e o resultado será equivalente
+`install` é idempotente: pode rodar de novo e o resultado será equivalente
 (regras regravadas, serviços apenas recarregados, backup novo criado).
 
 ## O que o script faz, passo a passo
@@ -52,7 +53,7 @@ A execução é idempotente: pode rodar de novo e o resultado será equivalente
    presença do pacote `ufw`. Tudo é gravado em `/var/backups/secure-efa-server/<timestamp>/initial-state`.
 4. **Faz backup** dos arquivos que serão modificados
    (`/etc/ssh/sshd_config`, drop-ins, jails, regras `iptables-save`, etc.).
-5. **Garante pacotes**: `openssh-server`, `fail2ban`, `python3-systemd`, `iptables`.
+5. **Garante pacotes**: `openssh-server`, `fail2ban`, `python3-systemd`, `iptables` e `conntrack`.
 6. **Configura SSH** via drop-in `/etc/ssh/sshd_config.d/00-secure-efa-server.conf`
    e recarrega o serviço.
 7. **Configura o firewall**:
@@ -67,6 +68,9 @@ A execução é idempotente: pode rodar de novo e o resultado será equivalente
      que reaplica as chains `EFA-DOCKER`/`EFA-DOCKER-ALLOW` e o salto
      `DOCKER-USER → EFA-DOCKER` toda vez que o Docker inicia.
    - Aplica as regras imediatamente se o Docker já estiver ativo.
+   - Configura `1.1.1.1` e `8.8.8.8` como DNS padrão dos containers,
+     preservando outras opções de `daemon.json`; se houver mudança, reinicia o
+     Docker uma vez para aplicá-la.
 8. **Configura Fail2Ban** — escreve `/etc/fail2ban/jail.local`, remove o
    legacy `/etc/fail2ban/jail.d/sshd.local`, valida com `fail2ban-client -t`,
    reinicia o serviço e confere que a jail `sshd` subiu.
@@ -129,18 +133,28 @@ no `FORWARD`.
 
 ### Docker (chain `DOCKER-USER` → `EFA-DOCKER`)
 
-Docker só consulta a chain `DOCKER-USER` quando o pacote chega da WAN
-(antes do DNAT). O script instala:
+Para tráfego encaminhado a containers, Docker consulta a chain
+`DOCKER-USER`. Quando o pacote chega a essa chain, o DNAT de uma porta
+publicada já ocorreu; por isso as regras usam `conntrack --ctorigdstport`
+para comparar a porta original do host. O script instala:
+
+A lógica segue a documentação oficial do Docker sobre
+[firewall com iptables](https://docs.docker.com/engine/network/firewall-iptables/).
 
 ````
 -A DOCKER-USER -j EFA-DOCKER          # injetado pelo drop-in do docker.service
 -A EFA-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 -A EFA-DOCKER -i docker0 -j RETURN    # trafego interno docker0
 -A EFA-DOCKER -i br+ -j RETURN        # trafego interno em bridges user-defined
+-A EFA-DOCKER -i docker_gwbridge -j ACCEPT # trafego de saida Docker Swarm
 -A EFA-DOCKER -j EFA-DOCKER-ALLOW
 -A EFA-DOCKER -j DROP
 -A EFA-DOCKER-ALLOW -p tcp --ctorigdstport 80 -j ACCEPT
 -A EFA-DOCKER-ALLOW -p tcp --ctorigdstport 443 -j ACCEPT
+# BEGIN secure-efa-server managed ports
+# Regras adicionadas por open-port, por exemplo:
+# -A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 6379 -j ACCEPT
+# END secure-efa-server managed ports
 -A EFA-DOCKER-ALLOW -j RETURN
 ````
 
@@ -149,9 +163,28 @@ Pontos-chave:
 - Apenas a porta de destino **publicada** no host (`--ctorigdstport`) é
   avaliada — é assim que Docker distingue "pacote chegou na porta 5400"
   vs "pacote chegou na 80".
-- Conexões estabelecidas/relacionadas passam direto.
+- Conexões estabelecidas/relacionadas passam direto. Ao executar
+  `close-port`, o script remove com `conntrack` os estados existentes da porta
+  nos fluxos IPv4 e IPv6, para que clientes persistentes não permaneçam
+  conectados.
 - Pacotes vindos de uma bridge do Docker (`br+`) voltam antes do
   bloqueio, evitando loop com regras do próprio Docker.
+- Tráfego originado em `docker_gwbridge` é aceito antes do bloqueio: é a
+  bridge interna de saída usada por serviços Docker Swarm, como Dokploy. A
+  condição de interface não aceita tráfego que venha da WAN.
+- Regras criadas por `open-port` ficam antes do `RETURN` terminal. A mesma
+  operação também cria a regra equivalente no `INPUT` do host; `close-port`
+  remove ambas de forma idempotente.
+
+### Containers acessando o host
+
+Por padrão, o `INPUT` aceita qualquer tráfego recebido por `docker0`, `br+` e
+`docker_gwbridge`. Assim, containers Docker, Compose e Swarm podem acessar
+serviços no host via `172.17.0.1` sem executar `open-port`; isso não expõe a
+porta à Internet porque a regra depende da interface interna. A consequência
+é que um container local pode tentar acessar outros serviços que escutem no
+host. Para algo que deva ser exclusivo do host, faça-o escutar em `127.0.0.1`
+ou aplique uma política própria.
 
 ## Pontos a monitorar
 
@@ -162,5 +195,8 @@ Pontos-chave:
   `/etc/systemd/system/docker.service.d/10-secure-efa-firewall.conf`
   é seguro, mas lembre que o script regrava esse arquivo a cada
   execução. Coloque mudanças persistentes em uma camada superior.
+- **DNS dos containers**: o script usa `1.1.1.1` e `8.8.8.8` no
+  `daemon.json`, para não herdar um DNS de VPN acessível apenas pelo host.
+  Nomes internos da VPN não serão resolvidos por containers por padrão.
 - **`/etc/docker/daemon.json`**: nunca defina `"iptables": false` ou
   `"firewall-backend": "nftables"` — o script aborta imediatamente.

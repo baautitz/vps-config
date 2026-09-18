@@ -5,6 +5,10 @@ inicial continua valendo — `install` aplica SSH, Fail2Ban, iptables e
 dropa o `ufw`. Depois disso, **abrir e fechar portas é uma única linha**
 que persiste no boot.
 
+Durante `install`, Docker recebe `1.1.1.1` e `8.8.8.8` como DNS padrão dos
+containers. Isso evita que builds herdem um DNS de VPN utilizável apenas pelo
+host. Se essa configuração mudar, Docker é reiniciado uma vez.
+
 ## Forma rápida (CLI)
 
 ````bash
@@ -12,9 +16,9 @@ que persiste no boot.
 sudo ./secure-efa-server.sh install
 
 # Abrir porta:
-sudo ./secure-efa-server.sh open-port 5400         # TCP 5400 (detecta Docker vs host)
+sudo ./secure-efa-server.sh open-port 5400         # TCP 5400 no host e no Docker
 sudo ./secure-efa-server.sh open-port 53/udp       # UDP 53
-sudo ./secure-efa-server.sh open-port 9000 --force # forçar como porta de host
+sudo ./secure-efa-server.sh open-port 9000         # TCP 9000 no host e no Docker
 
 # Fechar porta:
 sudo ./secure-efa-server.sh close-port 5400
@@ -26,17 +30,53 @@ sudo ./secure-efa-server.sh list-ports --docker
 sudo ./secure-efa-server.sh list-ports --host
 ````
 
-### Detecção automática Docker vs host
+### Uma operação, dois caminhos de tráfego
 
-`open-port` consulta `docker ps` para saber se a porta está publicada
-por algum container. O resultado da inspeção determina em qual chain a
-regra vai entrar:
+`open-port` sempre registra e aplica a mesma `<porta>/<protocolo>` nos
+dois escopos. Isso evita que uma porta funcione para o processo local, mas
+não para um container (ou o inverso):
 
-| Caso | Escopo | Onde a regra é inserida |
+| Escopo | Regra aplicada | Tráfego atendido |
 |---|---|---|
-| Algum container publica `<porta>/<proto>` na WAN | `docker` | `EFA-DOCKER-ALLOW` (antes do `COMMIT` em `/etc/iptables/secure-efa-docker.v4` e `.v6`) |
-| Nenhum container publica essa porta | `host` | `INPUT` (em `/etc/iptables/secure-efa-host.v4` e `.v6`) |
-| Você quer abrir como host mesmo havendo container | `host` (forçado) | `INPUT`, com `--force` |
+| `host` | `INPUT ... --dport <porta> -j ACCEPT` | Processo escutando diretamente no servidor |
+| `docker` | `EFA-DOCKER-ALLOW ... --ctorigdstport <porta> -j ACCEPT` | Porta publicada por um container Docker |
+
+Não é necessário que um container já publique a porta quando você executa
+`open-port`: a política Docker fica persistida e passa a valer assim que uma
+publicação correspondente existir. A regra não cria publicação/NAT no Docker;
+ela somente permite o tráfego caso o Docker a publique.
+
+### Container para serviço no host, sem exposição pública
+
+Quando um container acessa um serviço pelo gateway do host — por exemplo,
+`POSTGRES_HOST=172.17.0.1` e `POSTGRES_PORT=5236` — uma tarefa Swarm entra no
+host pela `docker_gwbridge`. Isso já é permitido por padrão, sem comando de
+porta: o firewall aceita tráfego que entra por `docker0`, `br+` (Compose) e
+`docker_gwbridge` (Swarm). Essas são interfaces locais, então a permissão não
+libera nenhuma porta na interface pública nem para a Internet.
+
+Consequência deliberada: qualquer container local pode tentar se conectar a
+qualquer serviço escutando no host. Portanto, processos administrativos que
+devem ser exclusivos do host precisam escutar somente em `127.0.0.1` ou ter
+uma política adicional própria.
+
+No longo prazo, para serviços Swarm, prefira pôr app e banco numa mesma rede
+overlay e conectar pelo nome do serviço e pela porta interna 5432. Assim não é
+preciso publicar o banco nem depender de `172.17.0.1`.
+
+O inverso também é verdadeiro: `docker run -p ...` ou `ports:` no Compose
+**não** publica a porta para a Internet por si só. Sem a entrada explícita no
+arquivo canônico criada por `open-port`, `EFA-DOCKER` a bloqueia. O próprio VPS
+e containers na rede interna podem continuar acessando o serviço, pois isso
+não é tráfego de entrada da WAN. As exceções base são TCP 80 e 443, que o
+script mantém públicos para o proxy web, além de TCP 22 para SSH no host.
+
+`close-port` remove os dois registros e reconstrói as duas políticas, mesmo
+quando o arquivo de estado estiver incompleto. Assim também limpa regras
+órfãs de versões anteriores. Ele também invalida, com `conntrack`, sessões
+TCP/UDP já estabelecidas para essa porta; clientes conectados, como Redis
+Insight, perdem a sessão na próxima troca de pacotes e não conseguem
+reconectar externamente.
 
 A regra **vale imediatamente** no kernel (v4 e v6) e **persiste no boot**
 porque o arquivo base é regenerado de forma atômica a cada chamada.
@@ -45,7 +85,8 @@ porque o arquivo base é regenerado de forma atômica a cada chamada.
 
 As portas gerenciadas ficam registradas em
 `/etc/iptables/secure-efa-allowed-ports.list` no formato
-`<porta>\t<proto>\t<escopo>\t<origem>`. Esse arquivo é a fonte de
+quatro campos separados por **TAB real**: porta, protocolo, escopo e origem.
+Esse arquivo é a fonte de
 verdade: `open-port`/`close-port` o editam e depois regeneram os
 arquivos `.v4`/`.v6`.
 
@@ -75,37 +116,23 @@ sudo iptables -I INPUT 1 \
   -p tcp -m conntrack --ctstate NEW --dport 9000 -j ACCEPT
 ````
 
-## Editar manualmente os arquivos base (avançado)
+## Arquivos de regras e edição manual
 
-Se você editar `/etc/iptables/secure-efa-host.v{4,6}` ou
-`/etc/iptables/secure-efa-docker.v{4,6}` direto:
-
-1. Mantenha o bloco entre `# BEGIN secure-efa-server managed ports`
-   e `# END secure-efa-server managed ports` intacto se quiser que o
-   utilitário continue entendendo o estado. Linhas fora desse bloco
-   são tratadas como "pre-existentes" e preservadas.
-2. Rode `sudo iptables-restore --test --noflush < arquivo` antes de
-   aplicar, para validar a sintaxe.
-3. Para aplicar imediatamente:
-
-   ````bash
-   sudo systemctl reload secure-efa-host-firewall     # arquivos host.v*
-   sudo iptables-restore --noflush < /etc/iptables/secure-efa-docker.v4
-   sudo ip6tables-restore --noflush < /etc/iptables/secure-efa-docker.v6
-   ````
-
-4. Se quiser que a edição manual **persista** entre `open-port`/
-   `close-port`, registre-a também em `/etc/iptables/secure-efa-allowed-ports.list`
-   para que o utilitário não a remova na próxima regeneração.
+Os arquivos `/etc/iptables/secure-efa-host.v{4,6}` e
+`/etc/iptables/secure-efa-docker.v{4,6}` são reconstruídos integralmente a
+partir da política fixa e do arquivo de estado canônico. Não edite esses
+arquivos para criar uma permissão persistente: a próxima chamada de
+`open-port` ou `close-port` substituirá a edição. Para permissões persistentes,
+use sempre a CLI.
 
 ## Diagnóstico
 
 | Sintoma | Onde olhar |
 |---|---|
-| `open-port 5400` diz "nenhum container publica esta porta" mas você queria Docker | Verifique `docker ps --format '{{.Ports}}'` e se o container está rodando. |
 | Porta não responde da WAN | `sudo iptables -nvL INPUT` e `sudo iptables -nvL EFA-DOCKER-ALLOW`. |
 | Regras somem após reboot | Confirme `systemctl status secure-efa-host-firewall` e que `secure-efa-allowed-ports.list` está preenchido. |
-| `open-port 5400` duplica regras | O utilitário limpa ocorrências anteriores da mesma porta antes de inserir. Se ainda ver duplicatas, rode `close-port 5400` e depois `open-port 5400` novamente. |
+| `open-port 5400` parece não expor um container | Confirme que o container realmente publicou a porta (`docker ps`); o comando libera o firewall, mas não cria a publicação Docker. |
+| `open-port 5400` duplica regras | Rode a versão atual do script; a operação é idempotente e reconstroi as regras a partir do estado canônico. |
 | IPv6 não responde | Rode `ip6tables-restore --test --noflush < /etc/iptables/secure-efa-host.v6` (e o equivalente docker). Se passar, `sudo ip6tables-restore --noflush < …`. |
 | Docker não sobe após `install` | O drop-in reaplica o salto a cada restart do Docker; veja `journalctl -u docker --no-pager`. |
 
@@ -124,11 +151,11 @@ sudo ./secure-efa-server.sh list-ports --docker
 sudo ./secure-efa-server.sh open-port 53/udp
 ````
 
-### Liberar app de monitoramento do host na 9090
+### Liberar app de monitoramento na 9090
 
 ````bash
-sudo ./secure-efa-server.sh open-port 9090 --force
-sudo ./secure-efa-server.sh list-ports --host
+sudo ./secure-efa-server.sh open-port 9090
+sudo ./secure-efa-server.sh list-ports
 ````
 
 ### Reverter tudo

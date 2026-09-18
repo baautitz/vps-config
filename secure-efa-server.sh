@@ -19,6 +19,7 @@ readonly HOST_V4="${IPTABLES_DIR}/secure-efa-host.v4"
 readonly HOST_V6="${IPTABLES_DIR}/secure-efa-host.v6"
 readonly DOCKER_V4="${IPTABLES_DIR}/secure-efa-docker.v4"
 readonly DOCKER_V6="${IPTABLES_DIR}/secure-efa-docker.v6"
+readonly DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 readonly HOST_UNIT="/etc/systemd/system/secure-efa-host-firewall.service"
 readonly DOCKER_DROPIN="/etc/systemd/system/docker.service.d/10-secure-efa-firewall.conf"
 readonly PORT_MARKER_BEGIN="# BEGIN secure-efa-server managed ports"
@@ -55,8 +56,8 @@ Uso: sudo ./${SCRIPT_NAME} <comando> [args]
 
 Subcomandos:
   install                       Configura o servidor (idempotente).
-  open-port <PORTA>[/udp]       Abre uma porta (Docker ou host) e persiste no boot.
-  close-port <PORTA>[/udp]      Fecha uma porta e remove da persistencia.
+  open-port <PORTA>[/udp]       Abre uma porta no host e no Docker; persiste no boot.
+  close-port <PORTA>[/udp]      Fecha uma porta no host e no Docker.
   list-ports [--docker|--host]  Lista portas liberadas (canonicas).
   help                          Mostra este texto.
 
@@ -126,7 +127,7 @@ reinstall_ufw() {
 ensure_packages() {
     local package
     local -a missing=()
-    for package in openssh-server fail2ban python3-systemd iptables; do
+    for package in openssh-server fail2ban python3-systemd iptables conntrack; do
         package_is_installed "$package" || missing+=("$package")
     done
     if (( ${#missing[@]} )); then
@@ -152,12 +153,12 @@ validate_firewall_environment() {
         die "Outro firewall ja controla o sistema: ${active_services[*]}. Desative antes (systemctl disable --now ...)."
     fi
 
-    if [[ -f /etc/docker/daemon.json ]]; then
-        if grep -Eq '"iptables"[[:space:]]*:[[:space:]]*false' /etc/docker/daemon.json; then
-            die "/etc/docker/daemon.json define iptables=false; remova essa opcao e reinicie o Docker."
+    if [[ -f "$DOCKER_DAEMON_JSON" ]]; then
+        if grep -Eq '"iptables"[[:space:]]*:[[:space:]]*false' "$DOCKER_DAEMON_JSON"; then
+            die "${DOCKER_DAEMON_JSON} define iptables=false; remova essa opcao e reinicie o Docker."
         fi
-        if grep -Eq '"firewall-backend"[[:space:]]*:[[:space:]]*"nftables"' /etc/docker/daemon.json; then
-            die "/etc/docker/daemon.json define firewall-backend=nftables; este script exige o backend iptables."
+        if grep -Eq '"firewall-backend"[[:space:]]*:[[:space:]]*"nftables"' "$DOCKER_DAEMON_JSON"; then
+            die "${DOCKER_DAEMON_JSON} define firewall-backend=nftables; este script exige o backend iptables."
         fi
     fi
 }
@@ -217,6 +218,7 @@ backup_configuration() {
     backup_item "$HOST_V6" host-v6
     backup_item "$DOCKER_V4" docker-v4
     backup_item "$DOCKER_V6" docker-v6
+    backup_item "$DOCKER_DAEMON_JSON" docker-daemon-json
     backup_item "$HOST_UNIT" host-unit
     backup_item "$DOCKER_DROPIN" docker-dropin
     iptables-save >"${BACKUP_DIR}/iptables.v4"
@@ -251,6 +253,7 @@ rollback() {
     restore_item "$HOST_V6" host-v6 || failed=1
     restore_item "$DOCKER_V4" docker-v4 || failed=1
     restore_item "$DOCKER_V6" docker-v6 || failed=1
+    restore_item "$DOCKER_DAEMON_JSON" docker-daemon-json || failed=1
     restore_item "$HOST_UNIT" host-unit || failed=1
     restore_item "$DOCKER_DROPIN" docker-dropin || failed=1
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -327,7 +330,11 @@ parse_port_spec() {
     else
         proto_part="tcp"
     fi
-    if ! [[ "$port_part" =~ ^[0-9]+$ ]] || (( port_part < 1 || port_part > 65535 )); then
+    if ! [[ "$port_part" =~ ^[0-9]+$ ]] || (( ${#port_part} > 5 )); then
+        die "Porta invalida: '${spec}' (esperado 1-65535 ou 1-65535/tcp|udp)."
+    fi
+    local decimal_port=$((10#$port_part))
+    if (( decimal_port < 1 || decimal_port > 65535 )); then
         die "Porta invalida: '${spec}' (esperado 1-65535 ou 1-65535/tcp|udp)."
     fi
     case "$proto_part" in
@@ -335,116 +342,33 @@ parse_port_spec() {
         *) die "Protocolo invalido em '${spec}': use tcp ou udp." ;;
     esac
     printf -v "$__proto_var" '%s' "$proto_part"
-    printf -v "$__port_var" '%d' "$port_part"
+    printf -v "$__port_var" '%d' "$decimal_port"
 }
 
-# Verifica se a porta esta publicada por algum container Docker ativo.
-# Imprime no stdout uma linha por container: "<container_id>\t<porta>\t<proto>".
-docker_published_ports() {
-    command -v docker >/dev/null 2>&1 || return 0
-    service_is_active docker || return 0
-    docker ps --no-trunc --format '{{.ID}}|{{.Names}}|{{.Ports}}' 2>/dev/null \
-        | awk -F'|' '
-            function flush() {
-                if (id != "") print id "\t" exposed_port "\t" exposed_proto
-            }
-            NF < 3 { next }
-            {
-                id = $1
-                ports = $3
-                np = split(ports, parts, ",")
-                ep = ""
-                eproto = ""
-                for (i = 1; i <= np; i++) {
-                    p = parts[i]
-                    sub(/^ */, "", p); sub(/ *$/, "", p)
-                    if (p == "") continue
-                    # Ex.: "0.0.0.0:5400->80/tcp" ou "5400-5401->80-81/tcp"
-                    if (match(p, /:([0-9]+)([-][0-9]+)?->[0-9]+/)) {
-                        exposed_port = substr(p, RSTART+1, RLENGTH-1)
-                        sub(/->.*/, "", exposed_port)
-                        if (match(p, /(tcp|udp)$/)) exposed_proto = substr(p, RSTART, RLENGTH)
-                        else exposed_proto = "tcp"
-                        if (exposed_port ~ /^[0-9]+$/) print id "\t" exposed_port + 0 "\t" exposed_proto
-                        if (match(p, /->([0-9]+)/)) {
-                            ep = substr(p, RSTART+2, RLENGTH-2)
-                            eproto = exposed_proto
-                        }
-                    } else if (match(p, /^([0-9]+)\/([a-z]+)/)) {
-                        ep = substr(p, 3, RLENGTH-3); eproto = substr(p, RSTART, RLENGTH)
-                        print id "\t" ep + 0 "\t" eproto
-                    }
-                }
-            }'
-}
-
-# Resolve se a porta e Docker ou host. Imprime "docker" ou "host" no stdout.
-resolve_scope() {
-    local port="$1" proto="$2"
-    local line container_id exposed_port exposed_proto
-    while IFS=$'\t' read -r container_id exposed_port exposed_proto; do
-        [[ -z "$container_id" ]] && continue
-        if (( exposed_port == port )) && [[ "$exposed_proto" == "$proto" ]]; then
-            printf "docker\t%s\n" "$container_id"
-            return 0
-        fi
-    done < <(docker_published_ports)
-    printf "host\n"
-    return 0
-}
-
-# Remove um bloco gerenciado por marcadores de um arquivo iptables-*.v4/.v6,
-# devolvendo as linhas ao stdout. Se nao houver bloco, devolve o arquivo
-# inalterado. Marcadores sao comentarios no formato "# BEGIN ..." / "# END ...".
-strip_managed_block() {
-    local path="$1"
-    [[ -f "$path" ]] || { return 0; }
-    awk -v begin="$PORT_MARKER_BEGIN" -v end="$PORT_MARKER_END" '
-        $0 == begin { in_block = 1; next }
-        in_block && $0 == end { in_block = 0; next }
-        !in_block { print }
-    ' "$path"
-}
-
-# Le o conjunto gerenciado de um arquivo. Imprime "<porta>\t<proto>" por linha.
-read_managed_ports() {
-    local path="$1"
-    [[ -f "$path" ]] || return 0
-    awk -v begin="$PORT_MARKER_BEGIN" -v end="$PORT_MARKER_END" '
-        $0 == begin { in_block = 1; next }
-        in_block && $0 == end { in_block = 0; next }
-        in_block { print }
-    ' "$path"
-}
-
-# Insere as linhas geradas entre os marcadores (ou cria o bloco se nao existir)
-# preservando o conteudo pre-existente do arquivo.
-write_managed_block() {
-    local path="$1" mode="$2" header="$3"; shift 3
-    local body=("$@")
-    local new_content
-    new_content="$(strip_managed_block "$path")"
-    {
-        printf '%s\n' "$new_content"
-        printf '%s\n' "$PORT_MARKER_BEGIN"
-        printf '%s\n' "$header"
-        printf '%s\n' "${body[@]}"
-        printf '%s\n' "$PORT_MARKER_END"
-    } | write_atomic "$path" "$mode"
-}
-
-# Carrega do arquivo de auditoria o conjunto canonico de portas liberadas,
-# usado para sincronizar marcadores e chains ativos. Formato: "<porta>\t<proto>\n".
+# Carrega e valida o estado canônico. Versões anteriores gravavam "\\t"
+# literal; essa leitura aceita o formato legado e qualquer gravação seguinte o
+# normaliza para TAB real. Comentários e linhas inválidas nunca viram regras.
 load_allowed_ports() {
     [[ -f "$ALLOWED_PORTS_FILE" ]] || return 0
-    grep -v '^[[:space:]]*$' "$ALLOWED_PORTS_FILE" || true
+    local raw port proto scope origin extra
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        [[ -z "$raw" || "$raw" == \#* ]] && continue
+        raw="${raw//\\t/$'\t'}"
+        IFS=$'\t' read -r port proto scope origin extra <<<"$raw"
+        [[ -z "$extra" && "$port" =~ ^[0-9]+$ ]] || continue
+        (( 10#$port >= 1 && 10#$port <= 65535 )) || continue
+        [[ "$proto" == tcp || "$proto" == udp ]] || continue
+        [[ "$scope" == host || "$scope" == docker ]] || continue
+        [[ -n "$origin" ]] || continue
+        printf '%s\t%s\t%s\t%s\n' "$port" "$proto" "$scope" "$origin"
+    done <"$ALLOWED_PORTS_FILE"
 }
 
 save_allowed_ports() {
     local -a entries=("$@")
     {
         printf '# Gerenciado por secure-efa-server.sh (open-port / close-port).\n'
-        printf '# Formato: <porta>\\t<proto>\\t<escopo>\\t<origem>\n'
+        printf '# Formato: <porta><TAB><proto><TAB><escopo><TAB><origem>.\n'
         if (( ${#entries[@]} )); then
             printf '%s\n' "${entries[@]}"
         fi
@@ -466,25 +390,34 @@ build_rule_line() {
     esac
 }
 
-# Aplica imediatamente uma regra em runtime (iptables/ip6tables).
-apply_rule_runtime() {
-    local tool="$1" scope="$2" port="$3" proto="$4" action="$5"  # action=insert|delete
-    local chain rule_flag selector_flag
-    case "$scope" in
-        host) chain="INPUT"; selector_flag="--dport" ;;
-        docker) chain="EFA-DOCKER-ALLOW"; selector_flag="--ctorigdstport" ;;
-    esac
-    case "$action" in
-        insert) rule_flag="-I" ;;
-        delete) rule_flag="-D" ;;
-    esac
-    "$tool" "$rule_flag" "$chain" 1 \
-        -p "$proto" -m conntrack --ctstate NEW "$selector_flag" "$port" -j ACCEPT \
-        >/dev/null 2>&1 || true
+# Elimina ocorrências runtime de uma porta em ambas as políticas e famílias.
+# A reconstrução subsequente restaura apenas o que estiver no estado canônico.
+delete_runtime_port() {
+    local port="$1" proto="$2"
+    while iptables -D INPUT -p "$proto" -m conntrack --ctstate NEW --dport "$port" -j ACCEPT 2>/dev/null; do :; done
+    while ip6tables -D INPUT -p "$proto" -m conntrack --ctstate NEW --dport "$port" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D EFA-DOCKER-ALLOW -p "$proto" -m conntrack --ctstate NEW --ctorigdstport "$port" -j ACCEPT 2>/dev/null; do :; done
+    while ip6tables -D EFA-DOCKER-ALLOW -p "$proto" -m conntrack --ctstate NEW --ctorigdstport "$port" -j ACCEPT 2>/dev/null; do :; done
 }
 
-# Regenera e reaplica o conjunto completo de portas gerenciadas em uma familia
-# (v4 ou v6). Reconstroi o arquivo base + reaplica no kernel.
+# Remove estados de conexão existentes cujo destino original era a porta.
+# Isso cobre tanto um serviço no host quanto uma porta Docker com DNAT: para
+# ambos, --orig-port-dst é a porta pública antes da tradução. O próximo pacote
+# de uma sessão removida não casa com ESTABLISHED e encontra o DROP da política.
+terminate_port_connections() {
+    local port="$1" proto="$2" family
+    if ! command -v conntrack >/dev/null 2>&1; then
+        log AVISO "conntrack nao esta instalado; conexoes ja estabelecidas em ${port}/${proto} expirarao normalmente. Rode install para habilitar derrubada imediata."
+        return 1
+    fi
+    for family in ipv4 ipv6; do
+        conntrack -D -f "$family" -p "$proto" --orig-port-dst "$port" >/dev/null 2>&1 || true
+    done
+}
+
+# Regenera deterministamente uma familia. O estado canônico é a única fonte
+# das portas dinâmicas: nunca reutilizamos regras antigas do arquivo, pois isso
+# faria uma porta fechada reaparecer ou duplicaria ACCEPTs a cada operação.
 refresh_ruleset() {
     local family="$1" scope="$2"  # family: v4|v6; scope: host|docker
     local tool file rules=() entry port proto
@@ -501,8 +434,7 @@ refresh_ruleset() {
         rules+=("$(build_rule_line "$scope" "$port" "$proto")")
     done < <(load_allowed_ports)
 
-    # Cabecalho + regras pre-existentes (origin=builtin) + bloco gerenciado.
-    local header existing=() built=() line
+    local header
     if [[ "$scope" == "host" ]]; then
         header="*filter
 :INPUT DROP [0:0]
@@ -511,6 +443,12 @@ refresh_ruleset() {
 -F INPUT
 -A INPUT -i lo -j ACCEPT
 -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+        header+="
+# Docker/Compose/Swarm podem acessar qualquer servico no host; estas interfaces
+# sao internas e nao correspondem a trafego vindo da Internet.
+-A INPUT -i docker0 -j ACCEPT
+-A INPUT -i br+ -j ACCEPT
+-A INPUT -i docker_gwbridge -j ACCEPT"
         if [[ "$family" == "v4" ]]; then
             header+="
 -A INPUT -p icmp -j ACCEPT
@@ -522,27 +460,7 @@ refresh_ruleset() {
         fi
         header+="
 -A INPUT -p tcp -m conntrack --ctstate NEW -m multiport --dports 22,80,443 -j ACCEPT"
-        # Pre-existentes (80/443) para Docker ficam em build_rule_line.
     fi
-
-    # Coleta regras pre-existentes (builtin) do arquivo atual.
-    local builtin=()
-    if [[ -f "$file" ]]; then
-        while IFS= read -r line; do builtin+=("$line"); done < <(read_managed_ports "$file")
-        while IFS= read -r line; do
-            builtin+=("$line")
-        done < <(awk -v begin="$PORT_MARKER_BEGIN" '
-            $0 == begin { in_block = 1; next }
-            in_block { next }
-            /^-A / { print }
-        ' "$file")
-    fi
-
-    # Conjunto final = builtin (ja existentes antes do utilitario) + rules.
-    local combined=()
-    combined+=("${builtin[@]}")
-    combined+=("${rules[@]}")
-    combined+=("-A EFA-DOCKER-ALLOW -j RETURN")
 
     {
         if [[ "$scope" == "host" ]]; then
@@ -556,10 +474,17 @@ refresh_ruleset() {
 -A EFA-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 -A EFA-DOCKER -i docker0 -j RETURN
 -A EFA-DOCKER -i br+ -j RETURN
+-A EFA-DOCKER -i docker_gwbridge -j ACCEPT
 -A EFA-DOCKER -j EFA-DOCKER-ALLOW
--A EFA-DOCKER -j DROP"
+-A EFA-DOCKER -j DROP
+-A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 80 -j ACCEPT
+-A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 443 -j ACCEPT"
         fi
-        printf '%s\n' "${combined[@]}"
+        printf '%s\n' "$PORT_MARKER_BEGIN"
+        printf '%s\n' '# Gerado a partir de secure-efa-allowed-ports.list; nao edite este bloco.'
+        printf '%s\n' "${rules[@]}"
+        printf '%s\n' "$PORT_MARKER_END"
+        [[ "$scope" == "docker" ]] && printf '%s\n' '-A EFA-DOCKER-ALLOW -j RETURN'
         printf '%s\n' "COMMIT"
     } > "$file.tmp"
     install -o root -g root -m 0600 "$file.tmp" "$file"
@@ -578,37 +503,48 @@ refresh_ruleset() {
     fi
 }
 
-# Refresca ambas as familias (v4 e v6) e ambos os escopos (host e docker).
+# Refresca ambas as familias de um escopo.
 refresh_all() {
     local scope="$1"
     refresh_ruleset v4 "$scope"
     refresh_ruleset v6 "$scope"
 }
 
-# Adiciona (scope,port,proto) ao arquivo canonico, idempotente.
+# Adiciona uma entrada ao arquivo canônico. Retorna 0 quando a entrada era nova
+# e 1 quando já existia; em ambos os casos elimina duplicatas legadas.
 add_allowed_entry() {
     local scope="$1" port="$2" proto="$3" origin="$4"
-    local line="${port}\t${proto}\t${scope}\t${origin}"
-    local current
-    current="$(load_allowed_ports | grep -Fx -- "${port}	${proto}	${scope}" || true)"
-    if [[ -n "$current" ]]; then
-        return 1  # ja existe
-    fi
-    local entries=()
-    while IFS= read -r e; do
-        [[ -n "$e" && "$e" != "${port}	${proto}	"* ]] && entries+=("$e")
+    local entries=() entry entry_port entry_proto entry_scope entry_origin found=0
+    while IFS=$'\t' read -r entry_port entry_proto entry_scope entry_origin; do
+        if [[ "$entry_port" == "$port" && "$entry_proto" == "$proto" && "$entry_scope" == "$scope" ]]; then
+            if (( found == 0 )); then
+                entries+=("${port}"$'\t'"${proto}"$'\t'"${scope}"$'\t'"${origin}")
+                found=1
+            fi
+            continue
+        fi
+        entries+=("${entry_port}"$'\t'"${entry_proto}"$'\t'"${entry_scope}"$'\t'"${entry_origin}")
     done < <(load_allowed_ports)
-    entries+=("$line")
+    if (( found == 0 )); then
+        entries+=("${port}"$'\t'"${proto}"$'\t'"${scope}"$'\t'"${origin}")
+    fi
     save_allowed_ports "${entries[@]}"
+    (( found == 0 ))
 }
 
-remove_allowed_entry() {
-    local scope="$1" port="$2" proto="$3"
-    local entries=() e
-    while IFS= read -r e; do
-        [[ -n "$e" && "$e" != "${port}	${proto}	${scope}" ]] && entries+=("$e")
+# Remove uma porta dos dois escopos numa única escrita atômica.
+remove_allowed_port() {
+    local port="$1" proto="$2"
+    local entries=() entry_port entry_proto entry_scope entry_origin removed=0
+    while IFS=$'\t' read -r entry_port entry_proto entry_scope entry_origin; do
+        if [[ "$entry_port" == "$port" && "$entry_proto" == "$proto" ]]; then
+            removed=1
+            continue
+        fi
+        entries+=("${entry_port}"$'\t'"${entry_proto}"$'\t'"${entry_scope}"$'\t'"${entry_origin}")
     done < <(load_allowed_ports)
     save_allowed_ports "${entries[@]}"
+    (( removed ))
 }
 
 require_installed() {
@@ -641,10 +577,11 @@ cmd_install() {
 }
 
 cmd_open_port() {
-    local spec="" force=0
+    local spec=""
     while (( $# )); do
         case "$1" in
-            --force|-f) force=1 ;;
+            # Compatibilidade: open-port agora sempre cobre host e Docker.
+            --force|-f) : ;;
             --help|-h) shift; show_port_help; return 0 ;;
             --) shift; break ;;
             -*) die "Opcao desconhecida para open-port: $1" ;;
@@ -652,7 +589,7 @@ cmd_open_port() {
         esac
         shift
     done
-    [[ -n "$spec" ]] || die "Uso: sudo ./${SCRIPT_NAME} open-port <PORTA>[/udp] [--force]"
+    [[ -n "$spec" ]] || die "Uso: sudo ./${SCRIPT_NAME} open-port <PORTA>[/udp]"
     (( EUID == 0 )) || die "Execute como root: sudo ./${SCRIPT_NAME} open-port ..."
     require_installed
 
@@ -662,24 +599,7 @@ cmd_open_port() {
     exec 9>"$LOCK_FILE"
     flock -n 9 || die "Outra instancia de ${SCRIPT_NAME} esta em execucao."
 
-    local resolved scope="" container_id=""
-    resolved="$(resolve_scope "$port" "$proto")"
-    scope="${resolved%%	*}"
-    container_id="${resolved#*	}"
-    [[ "$container_id" == "$resolved" ]] && container_id=""
-    if [[ "$scope" == "host" ]] && (( force == 0 )) && command -v docker >/dev/null 2>&1 && service_is_active docker; then
-        # Aviso: nenhum container publicando esta porta. Pode ser intencional.
-        log AVISO "Nenhum container Docker publica ${port}/${proto}; abrindo como porta de host."
-    fi
-
-    local origin="docker:${container_id:0:12}"
-    [[ "$scope" == "host" ]] && origin="manual"
-    if add_allowed_entry "$scope" "$port" "$proto" "$origin"; then
-        log INFO "Porta ${port}/${proto} ja estava liberada (escopo=${scope}); nada a fazer."
-        return 0
-    fi
-
-    # Backup minimo para auditoria (apenas arquivos tocados).
+    # Backup mínimo para auditoria, antes de qualquer mutação.
     local stamp; stamp="$(date -u '+%Y%m%dT%H%M%S.%NZ')"
     local snap="${BACKUP_OPEN_BASE}-${stamp}"
     install -d -o root -g root -m 0700 "$snap"
@@ -687,30 +607,32 @@ cmd_open_port() {
     [[ -f "$HOST_V6" ]] && cp -a "$HOST_V6" "$snap/host.v6"
     [[ -f "$DOCKER_V4" ]] && cp -a "$DOCKER_V4" "$snap/docker.v4"
     [[ -f "$DOCKER_V6" ]] && cp -a "$DOCKER_V6" "$snap/docker.v6"
+    [[ -f "$ALLOWED_PORTS_FILE" ]] && cp -a "$ALLOWED_PORTS_FILE" "$snap/allowed-ports.list"
 
-    # Regras builtin + gerenciadas (limpa runtime antes para evitar duplicatas).
-    case "$scope" in
-        host)
-            while iptables -D INPUT -p "$proto" -m conntrack --ctstate NEW --dport "$port" -j ACCEPT 2>/dev/null; do :; done
-            while ip6tables -D INPUT -p "$proto" -m conntrack --ctstate NEW --dport "$port" -j ACCEPT 2>/dev/null; do :; done
-            refresh_ruleset v4 host
-            refresh_ruleset v6 host
-            ;;
-        docker)
-            while iptables -D EFA-DOCKER-ALLOW -p "$proto" -m conntrack --ctstate NEW --ctorigdstport "$port" -j ACCEPT 2>/dev/null; do :; done
-            while ip6tables -D EFA-DOCKER-ALLOW -p "$proto" -m conntrack --ctstate NEW --ctorigdstport "$port" -j ACCEPT 2>/dev/null; do :; done
-            refresh_ruleset v4 docker
-            refresh_ruleset v6 docker
-            ;;
-    esac
-    log INFO "Porta ${port}/${proto} aberta (escopo=${scope}, origem=${origin}). Persistente no boot."
+    local host_added=0 docker_added=0
+    # Uma única chamada é sempre uma escolha explícita do operador, para os
+    # dois caminhos. Não use "managed": parecia que Docker tinha aberto a
+    # porta automaticamente, o que não é verdade.
+    add_allowed_entry host "$port" "$proto" explicit && host_added=1 || true
+    add_allowed_entry docker "$port" "$proto" explicit && docker_added=1 || true
+
+    # Remove sobras de versões antigas e reconstrói ambas as políticas.
+    delete_runtime_port "$port" "$proto"
+    refresh_all host
+    refresh_all docker
+
+    if (( host_added || docker_added )); then
+        log INFO "Porta ${port}/${proto} aberta nos escopos host e docker. Persistente no boot."
+    else
+        log INFO "Porta ${port}/${proto} ja estava liberada nos escopos host e docker; regras reaplicadas."
+    fi
 }
 
 cmd_close_port() {
-    local spec="" force=0
+    local spec=""
     while (( $# )); do
         case "$1" in
-            --force|-f) force=1 ;;
+            --force|-f) : ;;
             --help|-h) shift; show_port_help; return 0 ;;
             --) shift; break ;;
             -*) die "Opcao desconhecida para close-port: $1" ;;
@@ -718,7 +640,7 @@ cmd_close_port() {
         esac
         shift
     done
-    [[ -n "$spec" ]] || die "Uso: sudo ./${SCRIPT_NAME} close-port <PORTA>[/udp] [--force]"
+    [[ -n "$spec" ]] || die "Uso: sudo ./${SCRIPT_NAME} close-port <PORTA>[/udp]"
     (( EUID == 0 )) || die "Execute como root: sudo ./${SCRIPT_NAME} close-port ..."
     require_installed
 
@@ -729,31 +651,23 @@ cmd_close_port() {
     flock -n 9 || die "Outra instancia de ${SCRIPT_NAME} esta em execucao."
 
     local removed=0
-    local entry_scope
-    while IFS=$'\t' read -r _p _proto entry_scope _origin; do
-        [[ "$_p" == "$port" && "$_proto" == "$proto" ]] || continue
-        remove_allowed_entry "$entry_scope" "$port" "$proto"
-        case "$entry_scope" in
-            host)
-                while iptables -D INPUT -p "$proto" -m conntrack --ctstate NEW --dport "$port" -j ACCEPT 2>/dev/null; do :; done
-                while ip6tables -D INPUT -p "$proto" -m conntrack --ctstate NEW --dport "$port" -j ACCEPT 2>/dev/null; do :; done
-                refresh_ruleset v4 host
-                refresh_ruleset v6 host
-                ;;
-            docker)
-                while iptables -D EFA-DOCKER-ALLOW -p "$proto" -m conntrack --ctstate NEW --ctorigdstport "$port" -j ACCEPT 2>/dev/null; do :; done
-                while ip6tables -D EFA-DOCKER-ALLOW -p "$proto" -m conntrack --ctstate NEW --ctorigdstport "$port" -j ACCEPT 2>/dev/null; do :; done
-                refresh_ruleset v4 docker
-                refresh_ruleset v6 docker
-                ;;
-        esac
-        removed=1
-    done < <(load_allowed_ports)
+    remove_allowed_port "$port" "$proto" && removed=1 || true
+    # Mesmo sem registro canônico, elimina regras órfãs e reconstroi os dois
+    # arquivos; close-port é corretivo e idempotente.
+    delete_runtime_port "$port" "$proto"
+    refresh_all host
+    refresh_all docker
+    local sessions_invalidated=0
+    terminate_port_connections "$port" "$proto" && sessions_invalidated=1 || true
 
     if (( removed )); then
-        log INFO "Porta ${port}/${proto} fechada e removida da persistencia."
+        if (( sessions_invalidated )); then
+            log INFO "Porta ${port}/${proto} fechada nos escopos host e docker, removida da persistencia e sessoes existentes invalidadas."
+        else
+            log INFO "Porta ${port}/${proto} fechada nos escopos host e docker e removida da persistencia."
+        fi
     else
-        log INFO "Porta ${port}/${proto} nao estava liberada; nada a fazer."
+        log INFO "Porta ${port}/${proto} nao constava no estado; host e docker foram verificados e limpos."
     fi
 }
 
@@ -786,18 +700,15 @@ Uso: sudo ./${SCRIPT_NAME} <comando> [args]
 
 Comandos:
   install                       Configura o servidor (idempotente).
-  open-port <PORTA>[/udp]       Abre uma porta (Docker ou host) e persiste no boot.
-                                Detecta automaticamente se a porta esta publicada
-                                por um container Docker.
-                                Use --force para ignorar o aviso quando quiser abrir
-                                como porta de host mesmo existindo Docker.
-  close-port <PORTA>[/udp]      Fecha uma porta e remove da persistencia.
+  open-port <PORTA>[/udp]       Abre uma porta nos escopos host e Docker.
+                                A regra Docker fica pronta mesmo se nenhum
+                                container publicar a porta neste momento.
+  close-port <PORTA>[/udp]      Fecha uma porta nos escopos host e Docker.
   list-ports [--docker|--host]  Lista portas liberadas (canonicas).
 
 Exemplos:
   sudo ./${SCRIPT_NAME} open-port 5400
   sudo ./${SCRIPT_NAME} open-port 53/udp
-  sudo ./${SCRIPT_NAME} open-port 9000 --force
   sudo ./${SCRIPT_NAME} list-ports --docker
   sudo ./${SCRIPT_NAME} close-port 5400
 EOF
@@ -829,6 +740,10 @@ render_host_v4() {
 -F INPUT
 -A INPUT -i lo -j ACCEPT
 -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# Bridges locais Docker/Compose/Swarm: acesso container -> host, nunca WAN.
+-A INPUT -i docker0 -j ACCEPT
+-A INPUT -i br+ -j ACCEPT
+-A INPUT -i docker_gwbridge -j ACCEPT
 -A INPUT -p icmp -j ACCEPT
 -A INPUT -p udp --sport 67 --dport 68 -j ACCEPT
 -A INPUT -p tcp -m conntrack --ctstate NEW -m multiport --dports 22,80,443 -j ACCEPT
@@ -845,6 +760,10 @@ render_host_v6() {
 -F INPUT
 -A INPUT -i lo -j ACCEPT
 -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# Bridges locais Docker/Compose/Swarm: acesso container -> host, nunca WAN.
+-A INPUT -i docker0 -j ACCEPT
+-A INPUT -i br+ -j ACCEPT
+-A INPUT -i docker_gwbridge -j ACCEPT
 -A INPUT -p ipv6-icmp -j ACCEPT
 -A INPUT -p udp --sport 547 --dport 546 -j ACCEPT
 -A INPUT -p tcp -m conntrack --ctstate NEW -m multiport --dports 22,80,443 -j ACCEPT
@@ -862,6 +781,7 @@ render_docker_rules() {
 -A EFA-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 -A EFA-DOCKER -i docker0 -j RETURN
 -A EFA-DOCKER -i br+ -j RETURN
+-A EFA-DOCKER -i docker_gwbridge -j ACCEPT
 -A EFA-DOCKER -j EFA-DOCKER-ALLOW
 -A EFA-DOCKER -j DROP
 -A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 80 -j ACCEPT
@@ -877,20 +797,56 @@ ensure_docker_jump() {
     "$tool" -I DOCKER-USER 1 -j EFA-DOCKER
 }
 
-apply_docker_rules_now() {
-    if service_is_active docker; then
-        iptables -S DOCKER-USER >/dev/null 2>&1 || die "Docker ativo sem a chain DOCKER-USER."
-        iptables-restore --noflush <"$DOCKER_V4"
-        ensure_docker_jump iptables
-        if ip6tables -S DOCKER-USER >/dev/null 2>&1; then
-            ip6tables-restore --noflush <"$DOCKER_V6"
-            ensure_docker_jump ip6tables
-        fi
+# O NetBird pode substituir o resolv.conf do host por um DNS acessível apenas
+# no namespace do host. Containers usam estes resolvers públicos estáveis para
+# builds e tráfego de saída, sem alterar o DNS do próprio VPS.
+render_docker_daemon_config() {
+    python3 - "$DOCKER_DAEMON_JSON" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+config = {}
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as source:
+            config = json.load(source)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"Nao foi possivel ler {path}: {error}", file=sys.stderr)
+        raise SystemExit(1)
+if not isinstance(config, dict):
+    print(f"{path} deve conter um objeto JSON.", file=sys.stderr)
+    raise SystemExit(1)
+config["dns"] = ["1.1.1.1", "8.8.8.8"]
+print(json.dumps(config, indent=2, sort_keys=True))
+PY
+}
+
+# Retorna 0 somente quando daemon.json mudou e o Docker ativo precisa reiniciar.
+configure_docker_dns() {
+    command -v docker >/dev/null 2>&1 || return 1
+    command -v dockerd >/dev/null 2>&1 || die "dockerd nao foi encontrado."
+
+    install -d -o root -g root -m 0755 "$(dirname "$DOCKER_DAEMON_JSON")"
+    local rendered current=""
+    rendered="$(render_docker_daemon_config)" || die "Falha ao gerar ${DOCKER_DAEMON_JSON}. Corrija o JSON antes de executar install."
+    [[ -f "$DOCKER_DAEMON_JSON" ]] && current="$(<"$DOCKER_DAEMON_JSON")"
+    if [[ "$current" == "$rendered" ]]; then
+        return 1
     fi
+
+    printf '%s\n' "$rendered" | write_atomic "$DOCKER_DAEMON_JSON" 0644
+    dockerd --validate --config-file "$DOCKER_DAEMON_JSON" >/dev/null \
+        || die "${DOCKER_DAEMON_JSON} falhou na validacao do dockerd."
+    log INFO "Configurado DNS publico para containers: 1.1.1.1, 8.8.8.8."
+    return 0
 }
 
 configure_firewall() {
     log INFO "Configurando firewall iptables e a chain DOCKER-USER."
+    local docker_dns_changed=0
+    configure_docker_dns && docker_dns_changed=1 || true
     render_host_v4 | write_atomic "$HOST_V4" 0600
     render_host_v6 | write_atomic "$HOST_V6" 0600
     render_docker_rules | write_atomic "$DOCKER_V4" 0600
@@ -933,12 +889,19 @@ UNIT
     write_atomic "$DOCKER_DROPIN" 0644 <<'UNIT'
 [Service]
 # Docker cria DOCKER-USER; esta configuracao conecta a politica do servidor.
-ExecStartPost=/bin/sh -ec '/usr/sbin/iptables -S EFA-DOCKER >/dev/null 2>&1 || /usr/sbin/iptables-restore --noflush < /etc/iptables/secure-efa-docker.v4; while /usr/sbin/iptables -D DOCKER-USER -j EFA-DOCKER 2>/dev/null; do :; done; /usr/sbin/iptables -I DOCKER-USER 1 -j EFA-DOCKER; if /usr/sbin/ip6tables -S DOCKER-USER >/dev/null 2>&1; then /usr/sbin/ip6tables -S EFA-DOCKER >/dev/null 2>&1 || /usr/sbin/ip6tables-restore --noflush < /etc/iptables/secure-efa-docker.v6; while /usr/sbin/ip6tables -D DOCKER-USER -j EFA-DOCKER 2>/dev/null; do :; done; /usr/sbin/ip6tables -I DOCKER-USER 1 -j EFA-DOCKER; fi'
+ExecStartPost=/bin/sh -ec '/usr/sbin/iptables-restore --noflush < /etc/iptables/secure-efa-docker.v4; while /usr/sbin/iptables -D DOCKER-USER -j EFA-DOCKER 2>/dev/null; do :; done; /usr/sbin/iptables -I DOCKER-USER 1 -j EFA-DOCKER; if /usr/sbin/ip6tables -S DOCKER-USER >/dev/null 2>&1; then /usr/sbin/ip6tables-restore --noflush < /etc/iptables/secure-efa-docker.v6; while /usr/sbin/ip6tables -D DOCKER-USER -j EFA-DOCKER 2>/dev/null; do :; done; /usr/sbin/ip6tables -I DOCKER-USER 1 -j EFA-DOCKER; fi'
 UNIT
 
     systemctl daemon-reload
     systemctl enable --now secure-efa-host-firewall
-    apply_docker_rules_now
+    # install também respeita portas já registradas: o arquivo canônico é a
+    # fonte de verdade, inclusive em uma reinstalação do hardening.
+    refresh_all host
+    refresh_all docker
+    if (( docker_dns_changed )) && service_is_active docker; then
+        log INFO "Reiniciando Docker para aplicar o DNS dos containers."
+        systemctl restart docker
+    fi
 }
 
 configure_fail2ban() {
@@ -998,7 +961,8 @@ print_report() {
 main() {
     local sub="${1:-}"
     if [[ -z "$sub" ]]; then
-        sub="install"
+        show_help
+        return 0
     fi
     case "$sub" in
         install)
