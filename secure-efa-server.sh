@@ -962,6 +962,21 @@ EOF
     fail2ban-client -t
     systemctl enable --now fail2ban
     systemctl restart fail2ban
+
+    # Aguarda o socket do fail2ban ficar pronto antes do 'status sshd'.
+    # Em 24.04 ha uma janela de ~1-2s em que 'is-active' retorna 'active'
+    # mas o socket /var/run/fail2ban/fail2ban.sock ainda nao existe.
+    local f2b_attempts=0
+    while (( f2b_attempts < 30 )); do
+        if [[ -S /var/run/fail2ban/fail2ban.sock ]] && fail2ban-client ping >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+        f2b_attempts=$((f2b_attempts + 1))
+    done
+    if (( f2b_attempts >= 30 )); then
+        log AVISO "Socket do Fail2Ban nao ficou pronto apos 30s; continuando mesmo assim."
+    fi
     fail2ban-client status sshd >/dev/null
 }
 
