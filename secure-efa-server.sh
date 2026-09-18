@@ -138,18 +138,27 @@ ensure_packages() {
 }
 
 validate_firewall_environment() {
-    command -v iptables >/dev/null || die "iptables nao foi encontrado."
-    command -v iptables-restore >/dev/null || die "iptables-restore nao foi encontrado."
-    command -v ip6tables >/dev/null || die "ip6tables nao foi encontrado."
-    command -v ip6tables-restore >/dev/null || die "ip6tables-restore nao foi encontrado."
+    command -v iptables >/dev/null || die "iptables nao foi encontrado. Instale o pacote iptables."
+    command -v iptables-restore >/dev/null || die "iptables-restore nao foi encontrado. Instale o pacote iptables."
+    command -v ip6tables >/dev/null || die "ip6tables nao foi encontrado. Instale o pacote iptables."
+    command -v ip6tables-restore >/dev/null || die "ip6tables-restore nao foi encontrado. Instale o pacote iptables."
 
-    if service_is_active firewalld || service_is_enabled firewalld || service_is_active nftables || service_is_enabled nftables; then
-        die "firewalld ou nftables.service ja controla o firewall."
+    local active_services=()
+    if service_is_active firewalld; then active_services+=("firewalld(active)"); fi
+    if service_is_enabled firewalld; then active_services+=("firewalld(enabled)"); fi
+    if service_is_active nftables; then active_services+=("nftables(active)"); fi
+    if service_is_enabled nftables; then active_services+=("nftables(enabled)"); fi
+    if (( ${#active_services[@]} )); then
+        die "Outro firewall ja controla o sistema: ${active_services[*]}. Desative antes (systemctl disable --now ...)."
     fi
 
     if [[ -f /etc/docker/daemon.json ]]; then
-        grep -Eq '"iptables"[[:space:]]*:[[:space:]]*false' /etc/docker/daemon.json && die "Docker foi configurado com iptables=false."
-        grep -Eq '"firewall-backend"[[:space:]]*:[[:space:]]*"nftables"' /etc/docker/daemon.json && die "Docker usa backend nftables; este script exige o backend iptables."
+        if grep -Eq '"iptables"[[:space:]]*:[[:space:]]*false' /etc/docker/daemon.json; then
+            die "/etc/docker/daemon.json define iptables=false; remova essa opcao e reinicie o Docker."
+        fi
+        if grep -Eq '"firewall-backend"[[:space:]]*:[[:space:]]*"nftables"' /etc/docker/daemon.json; then
+            die "/etc/docker/daemon.json define firewall-backend=nftables; este script exige o backend iptables."
+        fi
     fi
 }
 
