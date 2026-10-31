@@ -24,6 +24,12 @@ políticas do host em cima do Docker.
 - Executar como `root` (`sudo ./secure-server.sh`).
 - `/root/.ssh/authorized_keys` válido, com permissões seguras
   (`700` em `/root` e `/root/.ssh`, `600` em `authorized_keys`).
+- Ao menos uma chave do root sem `command=` (imagens cloud costumam restringir
+  a chave com `command="echo Please login as..."`).
+- SSH somente na porta 22, inclusive no `ssh.socket`.
+- Rota padrão fora de `docker0`, `docker_gwbridge` e `br-*`.
+- Redes Docker com o nome padrão de bridge (`br-<id>`): bridges com nome
+  customizado não são tratadas como internas.
 - Nenhum dos seguintes em uso: `firewalld`, `nftables.service`,
   Docker com `"iptables": false` ou backend `"nftables"`.
 - Conexão com a internet para `apt-get install` (caso `openssh-server`,
@@ -104,8 +110,12 @@ e interrupção do usuário (`INT`/`TERM`). Em ambos:
 - Restaura `iptables-save`/`ip6tables-save` capturado no backup.
 - Recoloca cada arquivo no estado original (ou remove, se não existia antes).
 - Reaplica o estado `active`/`enabled` original de `ssh`, `fail2ban` e `ufw`.
-- Se o `ufw` estava instalado no estado inicial, tenta reinstalar o pacote
-  antes de reativá-lo.
+- Se o `ufw` estava instalado no estado inicial, tenta reinstalar o pacote e
+  restaurar `/etc/ufw` antes de reativá-lo.
+- Desabilita `secure-host-firewall` se ele não estava habilitado e reinicia o
+  Docker se o `install` o tiver reiniciado.
+
+Saídas por validação (`die`) depois do início das alterações também revertem.
 
 Se algo der errado durante a reversão, o backup fica em
 `/var/backups/secure-server/<timestamp>/` para inspeção manual.
@@ -145,7 +155,7 @@ A lógica segue a documentação oficial do Docker sobre
 -A DOCKER-USER -j VPS-DOCKER          # injetado pelo drop-in do docker.service
 -A VPS-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 -A VPS-DOCKER -i docker0 -j RETURN    # trafego interno docker0
--A VPS-DOCKER -i br+ -j RETURN        # trafego interno em bridges user-defined
+-A VPS-DOCKER -i br-+ -j RETURN        # trafego interno em bridges user-defined
 -A VPS-DOCKER -i docker_gwbridge -j ACCEPT # trafego de saida Docker Swarm
 -A VPS-DOCKER -j VPS-DOCKER-ALLOW
 -A VPS-DOCKER -j DROP
@@ -167,18 +177,23 @@ Pontos-chave:
   `close-port`, o script remove com `conntrack` os estados existentes da porta
   nos fluxos IPv4 e IPv6, para que clientes persistentes não permaneçam
   conectados.
-- Pacotes vindos de uma bridge do Docker (`br+`) voltam antes do
+- Pacotes vindos de uma bridge do Docker (`br-+`) voltam antes do
   bloqueio, evitando loop com regras do próprio Docker.
 - Tráfego originado em `docker_gwbridge` é aceito antes do bloqueio: é a
   bridge interna de saída usada por serviços Docker Swarm, como Dokploy. A
   condição de interface não aceita tráfego que venha da WAN.
+- As portas 22, 80 e 443/tcp são fixas: `open-port` e `close-port` recusam
+  essas portas sem alterar nada.
+- `open-port` e `close-port` preservam os saltos `f2b-*` do `INPUT`, mantendo
+  os bans ativos. Outras regras adicionadas ao `INPUT` são descartadas.
+- As chains são carregadas antes e depois do `dockerd` iniciar.
 - Regras criadas por `open-port` ficam antes do `RETURN` terminal. A mesma
   operação também cria a regra equivalente no `INPUT` do host; `close-port`
   remove ambas de forma idempotente.
 
 ### Containers acessando o host
 
-Por padrão, o `INPUT` aceita qualquer tráfego recebido por `docker0`, `br+` e
+Por padrão, o `INPUT` aceita qualquer tráfego recebido por `docker0`, `br-+` e
 `docker_gwbridge`. Assim, containers Docker, Compose e Swarm podem acessar
 serviços no host via `172.17.0.1` sem executar `open-port`; isso não expõe a
 porta à Internet porque a regra depende da interface interna. A consequência
@@ -187,7 +202,8 @@ host. Para algo que deva ser exclusivo do host, faça-o escutar em `127.0.0.1`
 ou aplique uma política própria.
 
 ## Pontos a monitorar
-
+- **IPv6 desativado no kernel** (`ipv6.disable=1`): as etapas de `ip6tables`
+  são ignoradas. Se reativar o IPv6, rode `install` de novo.
 - **Cloud-init / unattended-upgrades** podem reinstalar `ufw` em
   algumas imagens Ubuntu. Se isso acontecer, rode o script de novo —
   ele vai detectar e purgar de novo.

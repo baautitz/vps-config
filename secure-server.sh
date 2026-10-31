@@ -38,6 +38,9 @@ F2B_WAS_ENABLED=0
 UFW_WAS_ACTIVE=0
 UFW_WAS_ENABLED=0
 UFW_WAS_INSTALLED=0
+HOST_FW_WAS_ENABLED=0
+DOCKER_WAS_ACTIVE=0
+DOCKER_RESTARTED=0
 
 log() {
     local level="$1"
@@ -100,6 +103,57 @@ validate_authorized_keys() {
     permissions_are_safe /root/.ssh || die "/root/.ssh tem permissoes inseguras."
     permissions_are_safe "$AUTHORIZED_KEYS" || die "${AUTHORIZED_KEYS} tem permissoes inseguras."
     ssh-keygen -l -f "$AUTHORIZED_KEYS" >/dev/null 2>&1 || die "Nenhuma chave publica valida em ${AUTHORIZED_KEYS}."
+    # Imagens cloud costumam prefixar a chave do root com command="echo Please
+    # login as..."; com AllowUsers root, isso impediria qualquer acesso.
+    has_usable_root_key || die "${AUTHORIZED_KEYS} so tem chaves com command=; adicione uma chave de login direto para o root."
+}
+
+has_usable_root_key() {
+    grep -Ev '^[[:space:]]*(#|$)' "$AUTHORIZED_KEYS" | grep -v 'command=' | ssh-keygen -l -f - >/dev/null 2>&1
+}
+
+# O firewall so libera a porta 22: outra porta significaria perder o acesso.
+validate_ssh_port() {
+    local config ports listen
+    install -d -o root -g root -m 0755 /run/sshd
+    config="$(sshd -T)" || die "Nao foi possivel ler a configuracao efetiva do sshd."
+    ports="$(awk '$1 == "port" { print $2 }' <<<"$config")"
+    [[ "$ports" == 22 ]] || die "SSH configurado em outra porta ($(tr '\n' ' ' <<<"$ports")); este script exige somente a porta 22."
+    if service_is_active ssh.socket; then
+        listen="$(systemctl show ssh.socket -p Listen --value)"
+        if grep -v ':22 ' <<<"$listen" | grep -q .; then
+            die "ssh.socket escuta fora da porta 22; este script exige somente a porta 22."
+        fi
+    fi
+}
+
+verify_ssh_effective() {
+    local config expected
+    config="$(sshd -T)" || die "Nao foi possivel ler a configuracao efetiva do sshd."
+    for expected in 'port 22' 'permitrootlogin (prohibit-password|without-password)' \
+        'passwordauthentication no' 'kbdinteractiveauthentication no' \
+        'authenticationmethods publickey' 'allowusers root'; do
+        grep -Eqx "$expected" <<<"$config" || die "Configuracao efetiva do sshd difere do esperado: ${expected}."
+    done
+}
+
+# Com ipv6.disable=1 o kernel nao tem a pilha IPv6 e ip6tables falharia.
+ipv6_available() {
+    [[ -e /proc/net/if_inet6 ]]
+}
+
+# As regras de bridge confiam em docker0, br-* e docker_gwbridge: se a interface
+# publica tiver um desses nomes, a Internet seria tratada como trafego interno.
+validate_public_interface() {
+    command -v ip >/dev/null || die "ip nao foi encontrado. Instale o pacote iproute2."
+    local family dev
+    for family in -4 -6; do
+        while IFS= read -r dev; do
+            case "$dev" in
+                docker0|docker_gwbridge|br-*) die "A rota padrao usa ${dev}, nome reservado as bridges do Docker; o firewall nao seria seguro." ;;
+            esac
+        done < <(ip "$family" route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1) }')
+    done
 }
 
 package_is_installed() {
@@ -111,7 +165,6 @@ purge_ufw() {
     systemctl disable --now ufw >/dev/null 2>&1 || true
     export DEBIAN_FRONTEND=noninteractive
     apt-get purge -y -o Dpkg::Options::=--force-confold ufw || return 1
-    apt-get autoremove --purge -y >/dev/null 2>&1 || true
     rm -rf -- /etc/ufw
     return 0
 }
@@ -171,6 +224,8 @@ capture_initial_state() {
     service_is_active ufw && UFW_WAS_ACTIVE=1 || true
     service_is_enabled ufw && UFW_WAS_ENABLED=1 || true
     package_is_installed ufw && UFW_WAS_INSTALLED=1 || true
+    service_is_enabled secure-host-firewall && HOST_FW_WAS_ENABLED=1 || true
+    service_is_active docker && DOCKER_WAS_ACTIVE=1 || true
 }
 
 prepare_backup_dir() {
@@ -221,9 +276,13 @@ backup_configuration() {
     backup_item "$DOCKER_DAEMON_JSON" docker-daemon-json
     backup_item "$HOST_UNIT" host-unit
     backup_item "$DOCKER_DROPIN" docker-dropin
+    backup_item /etc/ufw ufw-config
     iptables-save >"${BACKUP_DIR}/iptables.v4"
-    ip6tables-save >"${BACKUP_DIR}/iptables.v6"
-    chmod 0600 "${BACKUP_DIR}/iptables.v4" "${BACKUP_DIR}/iptables.v6"
+    chmod 0600 "${BACKUP_DIR}/iptables.v4"
+    if ipv6_available; then
+        ip6tables-save >"${BACKUP_DIR}/iptables.v6"
+        chmod 0600 "${BACKUP_DIR}/iptables.v6"
+    fi
 }
 
 restore_enabled_state() {
@@ -244,7 +303,9 @@ rollback() {
 
     systemctl stop fail2ban >/dev/null 2>&1 || true
     iptables-restore <"${BACKUP_DIR}/iptables.v4" || failed=1
-    ip6tables-restore <"${BACKUP_DIR}/iptables.v6" || failed=1
+    if [[ -f "${BACKUP_DIR}/iptables.v6" ]]; then
+        ip6tables-restore <"${BACKUP_DIR}/iptables.v6" || failed=1
+    fi
     restore_item /etc/ssh/sshd_config sshd-config || failed=1
     restore_item "$SSH_DROPIN" ssh-dropin || failed=1
     restore_item "$F2B_JAIL" fail2ban-jail || failed=1
@@ -254,9 +315,14 @@ rollback() {
     restore_item "$DOCKER_V4" docker-v4 || failed=1
     restore_item "$DOCKER_V6" docker-v6 || failed=1
     restore_item "$DOCKER_DAEMON_JSON" docker-daemon-json || failed=1
+    (( HOST_FW_WAS_ENABLED )) || systemctl disable secure-host-firewall >/dev/null 2>&1 || true
     restore_item "$HOST_UNIT" host-unit || failed=1
     restore_item "$DOCKER_DROPIN" docker-dropin || failed=1
     systemctl daemon-reload >/dev/null 2>&1 || true
+
+    if (( DOCKER_RESTARTED && DOCKER_WAS_ACTIVE )); then
+        systemctl restart docker >/dev/null 2>&1 || failed=1
+    fi
 
     if (( SSH_WAS_ACTIVE )); then
         sshd -t && systemctl restart ssh >/dev/null 2>&1 || failed=1
@@ -267,6 +333,7 @@ rollback() {
 
     if (( UFW_WAS_INSTALLED )); then
         reinstall_ufw >/dev/null 2>&1 || failed=1
+        restore_item /etc/ufw ufw-config || failed=1
         if (( UFW_WAS_ACTIVE )); then
             systemctl enable --now ufw >/dev/null 2>&1 || failed=1
         else
@@ -290,6 +357,8 @@ rollback() {
 
 handle_error() {
     local status="$1" line="$2"
+    # Com set -E o trap tambem dispara em subshells; so o processo principal reverte.
+    (( BASHPID == $$ )) || exit "$status"
     trap - ERR INT TERM
     log ERRO "Comando falhou na linha ${line} (codigo ${status})."
     if (( MUTATIONS_STARTED && SUCCESS == 0 )); then
@@ -298,7 +367,18 @@ handle_error() {
     exit "$status"
 }
 
+# die encerra sem passar pelo trap ERR; EXIT garante a reversao nesses casos.
+handle_exit() {
+    local status="$?"
+    trap - EXIT ERR INT TERM
+    if (( status != 0 && MUTATIONS_STARTED && SUCCESS == 0 )); then
+        rollback
+    fi
+    exit "$status"
+}
+
 handle_signal() {
+    (( BASHPID == $$ )) || exit 130
     trap - ERR INT TERM
     log ERRO "Execucao interrompida."
     if (( MUTATIONS_STARTED && SUCCESS == 0 )); then
@@ -415,6 +495,15 @@ terminate_port_connections() {
     done
 }
 
+# -F INPUT apagaria o salto do Fail2Ban e os bans deixariam de valer; os saltos
+# entram na mesma transacao do restore, sem janela de exposicao.
+apply_host_rules() {
+    local tool="$1" file="$2" jumps
+    jumps="$("$tool" -S INPUT 2>/dev/null | grep -E -- '-j f2b-' || true)"
+    F2B_JUMPS="$jumps" awk '{ print } $0 == "-F INPUT" && ENVIRON["F2B_JUMPS"] != "" { print ENVIRON["F2B_JUMPS"] }' "$file" \
+        | "$tool"-restore --noflush
+}
+
 # Regenera deterministamente uma familia. O estado canônico é a única fonte
 # das portas dinâmicas: nunca reutilizamos regras antigas do arquivo, pois isso
 # faria uma porta fechada reaparecer ou duplicaria ACCEPTs a cada operação.
@@ -447,7 +536,7 @@ refresh_ruleset() {
 # Docker/Compose/Swarm podem acessar qualquer servico no host; estas interfaces
 # sao internas e nao correspondem a trafego vindo da Internet.
 -A INPUT -i docker0 -j ACCEPT
--A INPUT -i br+ -j ACCEPT
+-A INPUT -i br-+ -j ACCEPT
 -A INPUT -i docker_gwbridge -j ACCEPT"
         if [[ "$family" == "v4" ]]; then
             header+="
@@ -473,7 +562,7 @@ refresh_ruleset() {
 -F VPS-DOCKER-ALLOW
 -A VPS-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 -A VPS-DOCKER -i docker0 -j RETURN
--A VPS-DOCKER -i br+ -j RETURN
+-A VPS-DOCKER -i br-+ -j RETURN
 -A VPS-DOCKER -i docker_gwbridge -j ACCEPT
 -A VPS-DOCKER -j VPS-DOCKER-ALLOW
 -A VPS-DOCKER -j DROP
@@ -487,14 +576,17 @@ refresh_ruleset() {
         [[ "$scope" == "docker" ]] && printf '%s\n' '-A VPS-DOCKER-ALLOW -j RETURN'
         printf '%s\n' "COMMIT"
     } > "$file.tmp"
+    if [[ "$family" == "v6" ]] && ! ipv6_available; then
+        install -o root -g root -m 0600 "$file.tmp" "$file"
+        rm -f -- "$file.tmp"
+        return 0
+    fi
+    "$tool"-restore --test --noflush <"$file.tmp" || die "Arquivo ${file} falhou no teste de sintaxe."
     install -o root -g root -m 0600 "$file.tmp" "$file"
     rm -f -- "$file.tmp"
 
-    "$tool"-restore --test --noflush <"$file" || die "Arquivo ${file} falhou no teste de sintaxe."
-
     if [[ "$scope" == "host" ]]; then
-        systemctl reload secure-host-firewall 2>/dev/null || true
-        "$tool"-restore --noflush <"$file"
+        apply_host_rules "$tool" "$file"
     else
         if service_is_active docker && "$tool" -S DOCKER-USER >/dev/null 2>&1; then
             "$tool"-restore --noflush <"$file"
@@ -552,6 +644,16 @@ require_installed() {
         || die "Setup inicial nao encontrado. Rode primeiro: sudo ./${SCRIPT_NAME} install"
 }
 
+# Portas da politica fixa nao passam pelo estado canonico.
+reject_fixed_port() {
+    local port="$1" proto="$2"
+    if [[ "$proto" == tcp ]]; then
+        case "$port" in
+            22|80|443) die "Porta ${port}/tcp faz parte da politica fixa e permanece aberta; nenhuma alteracao foi feita." ;;
+        esac
+    fi
+}
+
 cmd_install() {
     validate_platform
     exec 9>"$LOCK_FILE"
@@ -561,9 +663,12 @@ cmd_install() {
     prepare_backup_dir
     trap 'handle_error $? $LINENO' ERR
     trap handle_signal INT TERM
+    trap handle_exit EXIT
 
     ensure_packages
     validate_firewall_environment
+    validate_public_interface
+    validate_ssh_port
     backup_configuration
     MUTATIONS_STARTED=1
     configure_ssh
@@ -572,7 +677,7 @@ cmd_install() {
     print_report
 
     SUCCESS=1
-    trap - ERR INT TERM
+    trap - EXIT ERR INT TERM
     log INFO "Configuracao concluida."
 }
 
@@ -595,6 +700,7 @@ cmd_open_port() {
 
     local proto port
     parse_port_spec "$spec" proto port
+    reject_fixed_port "$port" "$proto"
 
     exec 9>"$LOCK_FILE"
     flock -n 9 || die "Outra instancia de ${SCRIPT_NAME} esta em execucao."
@@ -646,6 +752,7 @@ cmd_close_port() {
 
     local proto port
     parse_port_spec "$spec" proto port
+    reject_fixed_port "$port" "$proto"
 
     exec 9>"$LOCK_FILE"
     flock -n 9 || die "Outra instancia de ${SCRIPT_NAME} esta em execucao."
@@ -727,6 +834,7 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 EOF
     sshd -t
+    verify_ssh_effective
     systemctl enable --now ssh
     systemctl reload ssh
 }
@@ -742,7 +850,7 @@ render_host_v4() {
 -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 # Bridges locais Docker/Compose/Swarm: acesso container -> host, nunca WAN.
 -A INPUT -i docker0 -j ACCEPT
--A INPUT -i br+ -j ACCEPT
+-A INPUT -i br-+ -j ACCEPT
 -A INPUT -i docker_gwbridge -j ACCEPT
 -A INPUT -p icmp -j ACCEPT
 -A INPUT -p udp --sport 67 --dport 68 -j ACCEPT
@@ -762,7 +870,7 @@ render_host_v6() {
 -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 # Bridges locais Docker/Compose/Swarm: acesso container -> host, nunca WAN.
 -A INPUT -i docker0 -j ACCEPT
--A INPUT -i br+ -j ACCEPT
+-A INPUT -i br-+ -j ACCEPT
 -A INPUT -i docker_gwbridge -j ACCEPT
 -A INPUT -p ipv6-icmp -j ACCEPT
 -A INPUT -p udp --sport 547 --dport 546 -j ACCEPT
@@ -780,7 +888,7 @@ render_docker_rules() {
 -F VPS-DOCKER-ALLOW
 -A VPS-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 -A VPS-DOCKER -i docker0 -j RETURN
--A VPS-DOCKER -i br+ -j RETURN
+-A VPS-DOCKER -i br-+ -j RETURN
 -A VPS-DOCKER -i docker_gwbridge -j ACCEPT
 -A VPS-DOCKER -j VPS-DOCKER-ALLOW
 -A VPS-DOCKER -j DROP
@@ -853,9 +961,11 @@ configure_firewall() {
     render_docker_rules | write_atomic "$DOCKER_V6" 0600
 
     iptables-restore --test --noflush <"$HOST_V4"
-    ip6tables-restore --test --noflush <"$HOST_V6"
     iptables-restore --test --noflush <"$DOCKER_V4"
-    ip6tables-restore --test --noflush <"$DOCKER_V6"
+    if ipv6_available; then
+        ip6tables-restore --test --noflush <"$HOST_V6"
+        ip6tables-restore --test --noflush <"$DOCKER_V6"
+    fi
 
     # O UFW sai do caminho: ele conflita com as regras do Docker.
     # Removemos o pacote para garantir que nenhuma ferramenta ou atualizacao
@@ -865,8 +975,10 @@ configure_firewall() {
     else
         systemctl disable --now ufw >/dev/null 2>&1 || true
     fi
-    iptables-restore --noflush <"$HOST_V4"
-    ip6tables-restore --noflush <"$HOST_V6"
+    apply_host_rules iptables "$HOST_V4"
+    if ipv6_available; then
+        apply_host_rules ip6tables "$HOST_V6"
+    fi
 
     write_atomic "$HOST_UNIT" 0644 <<'UNIT'
 [Unit]
@@ -880,7 +992,7 @@ Wants=network-pre.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/iptables-restore --noflush /etc/iptables/secure-host.v4
-ExecStart=/usr/sbin/ip6tables-restore --noflush /etc/iptables/secure-host.v6
+ExecStart=/bin/sh -ec 'if [ -e /proc/net/if_inet6 ]; then exec /usr/sbin/ip6tables-restore --noflush /etc/iptables/secure-host.v6; fi'
 
 [Install]
 WantedBy=multi-user.target
@@ -888,8 +1000,10 @@ UNIT
 
     write_atomic "$DOCKER_DROPIN" 0644 <<'UNIT'
 [Service]
-# Docker cria DOCKER-USER; esta configuracao conecta a politica do servidor.
-ExecStartPost=/bin/sh -ec '/usr/sbin/iptables-restore --noflush < /etc/iptables/secure-docker.v4; while /usr/sbin/iptables -D DOCKER-USER -j VPS-DOCKER 2>/dev/null; do :; done; /usr/sbin/iptables -I DOCKER-USER 1 -j VPS-DOCKER; if /usr/sbin/ip6tables -S DOCKER-USER >/dev/null 2>&1; then /usr/sbin/ip6tables-restore --noflush < /etc/iptables/secure-docker.v6; while /usr/sbin/ip6tables -D DOCKER-USER -j VPS-DOCKER 2>/dev/null; do :; done; /usr/sbin/ip6tables -I DOCKER-USER 1 -j VPS-DOCKER; fi'
+# A politica entra antes do dockerd, para containers com restart automatico nao
+# ficarem expostos, e de novo depois, garantindo o salto no topo de DOCKER-USER.
+ExecStartPre=/bin/sh -ec 'for family in 4 6; do if [ "$$family" = 4 ]; then tool=/usr/sbin/iptables; else [ -e /proc/net/if_inet6 ] || continue; tool=/usr/sbin/ip6tables; fi; $$tool -S DOCKER-USER >/dev/null 2>&1 || $$tool -N DOCKER-USER; $${tool}-restore --noflush < /etc/iptables/secure-docker.v$$family; while $$tool -D DOCKER-USER -j VPS-DOCKER 2>/dev/null; do :; done; $$tool -I DOCKER-USER 1 -j VPS-DOCKER; done'
+ExecStartPost=/bin/sh -ec 'for family in 4 6; do if [ "$$family" = 4 ]; then tool=/usr/sbin/iptables; else [ -e /proc/net/if_inet6 ] || continue; tool=/usr/sbin/ip6tables; fi; $$tool -S DOCKER-USER >/dev/null 2>&1 || $$tool -N DOCKER-USER; $${tool}-restore --noflush < /etc/iptables/secure-docker.v$$family; while $$tool -D DOCKER-USER -j VPS-DOCKER 2>/dev/null; do :; done; $$tool -I DOCKER-USER 1 -j VPS-DOCKER; done'
 UNIT
 
     systemctl daemon-reload
@@ -900,6 +1014,7 @@ UNIT
     refresh_all docker
     if (( docker_dns_changed )) && service_is_active docker; then
         log INFO "Reiniciando Docker para aplicar o DNS dos containers."
+        DOCKER_RESTARTED=1
         systemctl restart docker
     fi
 }
@@ -951,7 +1066,7 @@ print_report() {
     iptables -S DOCKER-USER 2>/dev/null || printf 'Docker ainda nao esta ativo.\n'
     printf '\n[Portas Docker permitidas]\n'
     iptables -S VPS-DOCKER-ALLOW 2>/dev/null || printf 'Docker ainda nao esta ativo.\n'
-    printf '\nLiberar Docker 5400: sudo iptables -I VPS-DOCKER-ALLOW 1 -p tcp -m conntrack --ctstate NEW --ctorigdstport 5400 -j ACCEPT\n'
+    printf '\nLiberar Docker 5400: sudo ./%s open-port 5400\n' "$SCRIPT_NAME"
     printf '\n[Fail2Ban]\n'
     fail2ban-client status sshd
     printf '\nBackup: %s\n' "$BACKUP_DIR"

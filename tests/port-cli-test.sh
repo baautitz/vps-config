@@ -164,7 +164,7 @@ test_open_is_idempotent_and_covers_both_scopes() {
     assert_entry 6379 tcp docker "$allowed"
     assert_contains '-A INPUT -p tcp -m conntrack --ctstate NEW -m multiport --dports 22,80,443 -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v4"
     assert_contains '-A INPUT -i docker0 -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v4"
-    assert_contains '-A INPUT -i br+ -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v4"
+    assert_contains '-A INPUT -i br-+ -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v4"
     assert_contains '-A INPUT -i docker_gwbridge -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v4"
     assert_contains '-A VPS-DOCKER -i docker_gwbridge -j ACCEPT' "${TEST_ROOT}/iptables/secure-docker.v4"
     assert_contains '-A VPS-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 80 -j ACCEPT' "${TEST_ROOT}/iptables/secure-docker.v4"
@@ -217,12 +217,56 @@ test_udp_and_legacy_state_are_reconciled() {
     ! grep -F '5400\ttcp\tdocker\tdocker:container-a' "$allowed" >/dev/null || fail 'estado legado remanescente nao foi normalizado para TAB real'
 }
 
+test_f2b_jump_survives_refresh() {
+    local allowed="${TEST_ROOT}/iptables/secure-allowed-ports.list"
+    make_mock iptables '
+[[ "${1:-}" == -S && "${2:-}" == INPUT ]] && printf -- "-A INPUT -p tcp -m multiport --dports 22 -j f2b-sshd\\n-A INPUT -i lo -j ACCEPT\\n"
+[[ "${1:-}" == -D ]] && exit 1
+exit 0'
+    make_mock iptables-restore '
+if [[ "$*" == --noflush ]]; then cat >>"${SECURE_TEST_LOG}.v4"; else cat >/dev/null; fi'
+    run_cli open-port 7000 >/dev/null
+    assert_contains '-A INPUT -p tcp -m multiport --dports 22 -j f2b-sshd' "${TEST_ROOT}/commands.log.v4"
+    assert_before '-F INPUT' '-j f2b-sshd' "${TEST_ROOT}/commands.log.v4"
+    ! grep -F -- '-j f2b-sshd' "${TEST_ROOT}/iptables/secure-host.v4" >/dev/null || fail 'salto do Fail2Ban foi persistido no arquivo'
+    run_cli close-port 7000 >/dev/null
+    assert_no_entry 7000 tcp host "$allowed"
+}
+
+test_fixed_ports_are_refused() {
+    local spec before output
+    before="$(cat "${TEST_ROOT}/iptables/secure-host.v4")"
+    for spec in 22 80 443 80/tcp; do
+        for command in open-port close-port; do
+            if output="$(PATH="${TEST_ROOT}/bin:${PATH}" SECURE_TEST_LOG="${TEST_ROOT}/commands.log" "${TEST_ROOT}/secure-server.sh" "$command" "$spec" 2>&1)"; then
+                fail "${command} ${spec} deveria falhar"
+            fi
+            [[ "$output" == *'politica fixa'* ]] || fail "mensagem inesperada: ${output}"
+        done
+    done
+    [[ "$before" == "$(cat "${TEST_ROOT}/iptables/secure-host.v4")" ]] || fail 'porta fixa alterou as regras'
+    run_cli open-port 80/udp >/dev/null
+    run_cli close-port 80/udp >/dev/null
+}
+
+test_ipv6_disabled_skips_ip6tables() {
+    sed -i 's|/proc/net/if_inet6|/nonexistent/if_inet6|g' "${TEST_ROOT}/secure-server.sh"
+    : >"${TEST_ROOT}/commands.log"
+    make_mock ip6tables-restore 'printf "ip6tables-restore %s\\n" "$*" >>"$SECURE_TEST_LOG"; cat >/dev/null'
+    run_cli open-port 7001 >/dev/null
+    ! grep -F 'ip6tables-restore' "${TEST_ROOT}/commands.log" >/dev/null || fail 'ip6tables-restore executado sem IPv6'
+    assert_contains '-A INPUT -p tcp -m conntrack --ctstate NEW --dport 7001 -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v6"
+}
+
 main() {
     prepare_target
     test_no_args_shows_help
     test_open_is_idempotent_and_covers_both_scopes
     test_close_removes_both_scopes_and_stale_rules
     test_udp_and_legacy_state_are_reconciled
+    test_fixed_ports_are_refused
+    test_f2b_jump_survives_refresh
+    test_ipv6_disabled_skips_ip6tables
     printf 'PASS: port CLI host+docker lifecycle\n'
 }
 
