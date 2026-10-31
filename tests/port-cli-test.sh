@@ -5,8 +5,8 @@
 set -Eeuo pipefail
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-readonly SOURCE_SCRIPT="${REPO_ROOT}/secure-efa-server.sh"
-TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/secure-efa-port-test.XXXXXX")"
+readonly SOURCE_SCRIPT="${REPO_ROOT}/secure-server.sh"
+TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/secure-port-test.XXXXXX")"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
 fail() {
@@ -70,18 +70,18 @@ prepare_target() {
     # privilegiam o processo, apenas redirecionam todos os caminhos mutaveis.
     sed \
         -e "s|/etc/iptables|${TEST_ROOT}/iptables|g" \
-        -e "s|/var/backups/secure-efa-server|${TEST_ROOT}/backups|g" \
-        -e "s|/run/lock/secure-efa-server.lock|${TEST_ROOT}/lock/secure-efa-server.lock|g" \
+        -e "s|/var/backups/secure-server|${TEST_ROOT}/backups|g" \
+        -e "s|/run/lock/secure-server.lock|${TEST_ROOT}/lock/secure-server.lock|g" \
         -e 's/(( EUID == 0 )) || die /true || die /g' \
-        "$SOURCE_SCRIPT" >"${TEST_ROOT}/secure-efa-server.sh"
-    chmod 0700 "${TEST_ROOT}/secure-efa-server.sh"
+        "$SOURCE_SCRIPT" >"${TEST_ROOT}/secure-server.sh"
+    chmod 0700 "${TEST_ROOT}/secure-server.sh"
 
     # Arquivos que indicam que o install ja foi executado; conteudo minimo e
     # valido para o gerador substituir durante open/close.
-    printf '*filter\nCOMMIT\n' >"${TEST_ROOT}/iptables/secure-efa-host.v4"
-    printf '*filter\nCOMMIT\n' >"${TEST_ROOT}/iptables/secure-efa-host.v6"
-    printf '*filter\nCOMMIT\n' >"${TEST_ROOT}/iptables/secure-efa-docker.v4"
-    printf '*filter\nCOMMIT\n' >"${TEST_ROOT}/iptables/secure-efa-docker.v6"
+    printf '*filter\nCOMMIT\n' >"${TEST_ROOT}/iptables/secure-host.v4"
+    printf '*filter\nCOMMIT\n' >"${TEST_ROOT}/iptables/secure-host.v6"
+    printf '*filter\nCOMMIT\n' >"${TEST_ROOT}/iptables/secure-docker.v4"
+    printf '*filter\nCOMMIT\n' >"${TEST_ROOT}/iptables/secure-docker.v6"
 
     make_mock systemctl '
 case "${1:-}" in
@@ -90,7 +90,7 @@ case "${1:-}" in
 esac'
     make_mock docker '
 if [[ "${1:-}" == ps ]]; then
-  printf "%s\\n" "${SECURE_EFA_TEST_DOCKER_PS:-}"
+  printf "%s\\n" "${SECURE_TEST_DOCKER_PS:-}"
 fi'
     # O script usa `install` para criar diretórios e publicar arquivos de
     # regras atomicamente. O mock mantém só essas semânticas; ignora ownership
@@ -116,31 +116,31 @@ else
   cp -- "${paths[0]}" "${paths[1]}"
 fi'
     make_mock iptables '
-printf "iptables %s\\n" "$*" >>"$SECURE_EFA_TEST_LOG"
+printf "iptables %s\\n" "$*" >>"$SECURE_TEST_LOG"
 [[ "${1:-}" == -S ]] && exit 0
 [[ "${1:-}" == -D ]] && exit 1
 exit 0'
     make_mock ip6tables '
-printf "ip6tables %s\\n" "$*" >>"$SECURE_EFA_TEST_LOG"
+printf "ip6tables %s\\n" "$*" >>"$SECURE_TEST_LOG"
 [[ "${1:-}" == -S ]] && exit 0
 [[ "${1:-}" == -D ]] && exit 1
 exit 0'
     make_mock iptables-restore '
 cat >/dev/null
-printf "iptables-restore %s\\n" "$*" >>"$SECURE_EFA_TEST_LOG"'
+printf "iptables-restore %s\\n" "$*" >>"$SECURE_TEST_LOG"'
     make_mock ip6tables-restore '
 cat >/dev/null
-printf "ip6tables-restore %s\\n" "$*" >>"$SECURE_EFA_TEST_LOG"'
+printf "ip6tables-restore %s\\n" "$*" >>"$SECURE_TEST_LOG"'
     make_mock conntrack '
-printf "conntrack %s\\n" "$*" >>"$SECURE_EFA_TEST_LOG"
+printf "conntrack %s\\n" "$*" >>"$SECURE_TEST_LOG"
 exit 0'
 }
 
 run_cli() {
     local output
-    output="$(PATH="${TEST_ROOT}/bin:${PATH}" SECURE_EFA_TEST_LOG="${TEST_ROOT}/commands.log" \
-        SECURE_EFA_TEST_DOCKER_PS='abc123|redis|0.0.0.0:6379->6379/tcp' \
-        "${TEST_ROOT}/secure-efa-server.sh" "$@" 2>&1)" || {
+    output="$(PATH="${TEST_ROOT}/bin:${PATH}" SECURE_TEST_LOG="${TEST_ROOT}/commands.log" \
+        SECURE_TEST_DOCKER_PS='abc123|redis|0.0.0.0:6379->6379/tcp' \
+        "${TEST_ROOT}/secure-server.sh" "$@" 2>&1)" || {
         printf '%s\n' "$output" >&2
         fail "comando falhou: $*"
     }
@@ -150,31 +150,31 @@ run_cli() {
 test_no_args_shows_help() {
     local output
     output="$(run_cli)"
-    [[ "$output" == *'Uso: sudo ./secure-efa-server.sh <comando> [args]'* ]] \
+    [[ "$output" == *'Uso: sudo ./secure-server.sh <comando> [args]'* ]] \
         || fail 'executar sem subcomando nao exibiu a ajuda'
 }
 
 test_open_is_idempotent_and_covers_both_scopes() {
-    local allowed="${TEST_ROOT}/iptables/secure-efa-allowed-ports.list"
+    local allowed="${TEST_ROOT}/iptables/secure-allowed-ports.list"
     run_cli open-port 6379 >/dev/null
 
     # Uma porta publicada pelo Docker deve liberar o host e a cadeia Docker;
     # assim uma mudanca de publicacao nao deixa uma das camadas divergente.
     assert_entry 6379 tcp host "$allowed"
     assert_entry 6379 tcp docker "$allowed"
-    assert_contains '-A INPUT -p tcp -m conntrack --ctstate NEW -m multiport --dports 22,80,443 -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-host.v4"
-    assert_contains '-A INPUT -i docker0 -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-host.v4"
-    assert_contains '-A INPUT -i br+ -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-host.v4"
-    assert_contains '-A INPUT -i docker_gwbridge -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-host.v4"
-    assert_contains '-A EFA-DOCKER -i docker_gwbridge -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-docker.v4"
-    assert_contains '-A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 80 -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-docker.v4"
-    assert_contains '-A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 443 -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-docker.v4"
-    assert_contains '-A INPUT -p tcp -m conntrack --ctstate NEW --dport 6379 -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-host.v4"
-    assert_contains '-A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 6379 -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-docker.v4"
+    assert_contains '-A INPUT -p tcp -m conntrack --ctstate NEW -m multiport --dports 22,80,443 -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v4"
+    assert_contains '-A INPUT -i docker0 -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v4"
+    assert_contains '-A INPUT -i br+ -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v4"
+    assert_contains '-A INPUT -i docker_gwbridge -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v4"
+    assert_contains '-A VPS-DOCKER -i docker_gwbridge -j ACCEPT' "${TEST_ROOT}/iptables/secure-docker.v4"
+    assert_contains '-A VPS-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 80 -j ACCEPT' "${TEST_ROOT}/iptables/secure-docker.v4"
+    assert_contains '-A VPS-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 443 -j ACCEPT' "${TEST_ROOT}/iptables/secure-docker.v4"
+    assert_contains '-A INPUT -p tcp -m conntrack --ctstate NEW --dport 6379 -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v4"
+    assert_contains '-A VPS-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 6379 -j ACCEPT' "${TEST_ROOT}/iptables/secure-docker.v4"
     assert_before \
-        '-A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 6379 -j ACCEPT' \
-        '-A EFA-DOCKER-ALLOW -j RETURN' \
-        "${TEST_ROOT}/iptables/secure-efa-docker.v4"
+        '-A VPS-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 6379 -j ACCEPT' \
+        '-A VPS-DOCKER-ALLOW -j RETURN' \
+        "${TEST_ROOT}/iptables/secure-docker.v4"
 
     run_cli open-port 6379 >/dev/null
     [[ "$(awk -F '\t' '$1 == 6379 && $2 == "tcp" && $3 == "host" { count++ } END { print count + 0 }' "$allowed")" == 1 ]] || fail 'open duplicou a entrada host'
@@ -182,23 +182,23 @@ test_open_is_idempotent_and_covers_both_scopes() {
 }
 
 test_close_removes_both_scopes_and_stale_rules() {
-    local allowed="${TEST_ROOT}/iptables/secure-efa-allowed-ports.list"
+    local allowed="${TEST_ROOT}/iptables/secure-allowed-ports.list"
     run_cli close-port 6379 >/dev/null
     assert_no_entry 6379 tcp host "$allowed"
     assert_no_entry 6379 tcp docker "$allowed"
-    ! grep -F -- '--dport 6379 -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-host.v4" >/dev/null || fail 'regra host continuou no arquivo regenerado'
-    ! grep -F -- '--ctorigdstport 6379 -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-docker.v4" >/dev/null || fail 'regra Docker continuou no arquivo regenerado'
+    ! grep -F -- '--dport 6379 -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v4" >/dev/null || fail 'regra host continuou no arquivo regenerado'
+    ! grep -F -- '--ctorigdstport 6379 -j ACCEPT' "${TEST_ROOT}/iptables/secure-docker.v4" >/dev/null || fail 'regra Docker continuou no arquivo regenerado'
     assert_contains 'conntrack -D -f ipv4 -p tcp --orig-port-dst 6379' "${TEST_ROOT}/commands.log"
     assert_contains 'conntrack -D -f ipv6 -p tcp --orig-port-dst 6379' "${TEST_ROOT}/commands.log"
 }
 
 test_udp_and_legacy_state_are_reconciled() {
-    local allowed="${TEST_ROOT}/iptables/secure-efa-allowed-ports.list"
+    local allowed="${TEST_ROOT}/iptables/secure-allowed-ports.list"
     run_cli open-port 5353/udp >/dev/null
     assert_entry 5353 udp host "$allowed"
     assert_entry 5353 udp docker "$allowed"
-    assert_contains '-A INPUT -p udp -m conntrack --ctstate NEW --dport 5353 -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-host.v6"
-    assert_contains '-A EFA-DOCKER-ALLOW -p udp -m conntrack --ctstate NEW --ctorigdstport 5353 -j ACCEPT' "${TEST_ROOT}/iptables/secure-efa-docker.v6"
+    assert_contains '-A INPUT -p udp -m conntrack --ctstate NEW --dport 5353 -j ACCEPT' "${TEST_ROOT}/iptables/secure-host.v6"
+    assert_contains '-A VPS-DOCKER-ALLOW -p udp -m conntrack --ctstate NEW --ctorigdstport 5353 -j ACCEPT' "${TEST_ROOT}/iptables/secure-docker.v6"
     run_cli close-port 5353/udp >/dev/null
     assert_no_entry 5353 udp host "$allowed"
     assert_no_entry 5353 udp docker "$allowed"
@@ -206,7 +206,7 @@ test_udp_and_legacy_state_are_reconciled() {
     # A versao com defeito gravou a sequencia literal "\\t". O close deve
     # compreender esse estado antigo e removê-lo, evitando uma porta órfã.
     printf '%s\n' \
-        '# Gerenciado por secure-efa-server.sh (open-port / close-port).' \
+        '# Gerenciado por secure-server.sh (open-port / close-port).' \
         '# Formato: <porta>\t<proto>\t<escopo>\t<origem>' \
         '5400\ttcp\tdocker\tdocker:container-a' \
         '6380\ttcp\tdocker\tdocker:container-b' >"$allowed"

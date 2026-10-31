@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/secure-efa-dns-test.XXXXXX")"
+TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/secure-dns-test.XXXXXX")"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
 fail() {
@@ -23,8 +23,8 @@ printf '%s\n' \
 sed \
     -e "s|/etc/docker/daemon.json|${TEST_ROOT}/docker/daemon.json|g" \
     -e 's/^    main "\$@"$/    configure_docker_dns/' \
-    "$REPO_ROOT/secure-efa-server.sh" >"$TEST_ROOT/secure-efa-server.sh"
-chmod 0700 "$TEST_ROOT/secure-efa-server.sh"
+    "$REPO_ROOT/secure-server.sh" >"$TEST_ROOT/secure-server.sh"
+chmod 0700 "$TEST_ROOT/secure-server.sh"
 
 make_mock() {
     local name="$1" body="$2"
@@ -47,7 +47,7 @@ fi
 exit 64'
 make_mock chown 'exit 0'
 
-PATH="$TEST_ROOT/bin:$PATH" "$TEST_ROOT/secure-efa-server.sh" || fail 'configuracao inicial falhou'
+PATH="$TEST_ROOT/bin:$PATH" "$TEST_ROOT/secure-server.sh" || fail 'configuracao inicial falhou'
 
 python3 - "$TEST_ROOT/docker/daemon.json" <<'PY' || fail 'daemon.json nao preservou opcoes nem definiu DNS'
 import json
@@ -60,7 +60,7 @@ assert config["log-opts"] == {"max-size": "10m"}
 PY
 
 # A segunda execucao nao deve regravar nem sinalizar mudanca.
-if PATH="$TEST_ROOT/bin:$PATH" "$TEST_ROOT/secure-efa-server.sh"; then
+if PATH="$TEST_ROOT/bin:$PATH" "$TEST_ROOT/secure-server.sh"; then
     fail 'segunda execucao deveria indicar que daemon.json ja esta atual'
 fi
 

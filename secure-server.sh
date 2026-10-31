@@ -8,24 +8,24 @@ IFS=$'\n\t'
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly BACKUP_BASE="/var/backups/secure-efa-server"
-readonly LOCK_FILE="/run/lock/secure-efa-server.lock"
+readonly BACKUP_BASE="/var/backups/secure-server"
+readonly LOCK_FILE="/run/lock/secure-server.lock"
 readonly AUTHORIZED_KEYS="/root/.ssh/authorized_keys"
-readonly SSH_DROPIN="/etc/ssh/sshd_config.d/00-secure-efa-server.conf"
+readonly SSH_DROPIN="/etc/ssh/sshd_config.d/00-secure-server.conf"
 readonly F2B_JAIL="/etc/fail2ban/jail.local"
 readonly F2B_LEGACY_JAIL="/etc/fail2ban/jail.d/sshd.local"
 readonly IPTABLES_DIR="/etc/iptables"
-readonly HOST_V4="${IPTABLES_DIR}/secure-efa-host.v4"
-readonly HOST_V6="${IPTABLES_DIR}/secure-efa-host.v6"
-readonly DOCKER_V4="${IPTABLES_DIR}/secure-efa-docker.v4"
-readonly DOCKER_V6="${IPTABLES_DIR}/secure-efa-docker.v6"
+readonly HOST_V4="${IPTABLES_DIR}/secure-host.v4"
+readonly HOST_V6="${IPTABLES_DIR}/secure-host.v6"
+readonly DOCKER_V4="${IPTABLES_DIR}/secure-docker.v4"
+readonly DOCKER_V6="${IPTABLES_DIR}/secure-docker.v6"
 readonly DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
-readonly HOST_UNIT="/etc/systemd/system/secure-efa-host-firewall.service"
-readonly DOCKER_DROPIN="/etc/systemd/system/docker.service.d/10-secure-efa-firewall.conf"
-readonly PORT_MARKER_BEGIN="# BEGIN secure-efa-server managed ports"
-readonly PORT_MARKER_END="# END secure-efa-server managed ports"
-readonly ALLOWED_PORTS_FILE="${IPTABLES_DIR}/secure-efa-allowed-ports.list"
-readonly BACKUP_OPEN_BASE="/var/backups/secure-efa-server/open-port"
+readonly HOST_UNIT="/etc/systemd/system/secure-host-firewall.service"
+readonly DOCKER_DROPIN="/etc/systemd/system/docker.service.d/10-secure-firewall.conf"
+readonly PORT_MARKER_BEGIN="# BEGIN secure-server managed ports"
+readonly PORT_MARKER_END="# END secure-server managed ports"
+readonly ALLOWED_PORTS_FILE="${IPTABLES_DIR}/secure-allowed-ports.list"
+readonly BACKUP_OPEN_BASE="/var/backups/secure-server/open-port"
 
 BACKUP_DIR=""
 MUTATIONS_STARTED=0
@@ -367,7 +367,7 @@ load_allowed_ports() {
 save_allowed_ports() {
     local -a entries=("$@")
     {
-        printf '# Gerenciado por secure-efa-server.sh (open-port / close-port).\n'
+        printf '# Gerenciado por secure-server.sh (open-port / close-port).\n'
         printf '# Formato: <porta><TAB><proto><TAB><escopo><TAB><origem>.\n'
         if (( ${#entries[@]} )); then
             printf '%s\n' "${entries[@]}"
@@ -375,7 +375,7 @@ save_allowed_ports() {
     } | write_atomic "$ALLOWED_PORTS_FILE" 0600
 }
 
-# Constrói a linha iptables para INPUT (host) ou EFA-DOCKER-ALLOW (docker),
+# Constrói a linha iptables para INPUT (host) ou VPS-DOCKER-ALLOW (docker),
 # no formato esperado pelos arquivos -restore.
 build_rule_line() {
     local scope="$1" port="$2" proto="$3"
@@ -384,7 +384,7 @@ build_rule_line() {
             printf -- '-A INPUT -p %s -m conntrack --ctstate NEW --dport %d -j ACCEPT\n' "$proto" "$port"
             ;;
         docker)
-            printf -- '-A EFA-DOCKER-ALLOW -p %s -m conntrack --ctstate NEW --ctorigdstport %d -j ACCEPT\n' "$proto" "$port"
+            printf -- '-A VPS-DOCKER-ALLOW -p %s -m conntrack --ctstate NEW --ctorigdstport %d -j ACCEPT\n' "$proto" "$port"
             ;;
         *) die "Escopo invalido: ${scope} (esperado host ou docker)." ;;
     esac
@@ -396,8 +396,8 @@ delete_runtime_port() {
     local port="$1" proto="$2"
     while iptables -D INPUT -p "$proto" -m conntrack --ctstate NEW --dport "$port" -j ACCEPT 2>/dev/null; do :; done
     while ip6tables -D INPUT -p "$proto" -m conntrack --ctstate NEW --dport "$port" -j ACCEPT 2>/dev/null; do :; done
-    while iptables -D EFA-DOCKER-ALLOW -p "$proto" -m conntrack --ctstate NEW --ctorigdstport "$port" -j ACCEPT 2>/dev/null; do :; done
-    while ip6tables -D EFA-DOCKER-ALLOW -p "$proto" -m conntrack --ctstate NEW --ctorigdstport "$port" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D VPS-DOCKER-ALLOW -p "$proto" -m conntrack --ctstate NEW --ctorigdstport "$port" -j ACCEPT 2>/dev/null; do :; done
+    while ip6tables -D VPS-DOCKER-ALLOW -p "$proto" -m conntrack --ctstate NEW --ctorigdstport "$port" -j ACCEPT 2>/dev/null; do :; done
 }
 
 # Remove estados de conexão existentes cujo destino original era a porta.
@@ -467,24 +467,24 @@ refresh_ruleset() {
             printf '%s\n' "$header"
         else
             printf '%s\n' "*filter
-:EFA-DOCKER - [0:0]
-:EFA-DOCKER-ALLOW - [0:0]
--F EFA-DOCKER
--F EFA-DOCKER-ALLOW
--A EFA-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
--A EFA-DOCKER -i docker0 -j RETURN
--A EFA-DOCKER -i br+ -j RETURN
--A EFA-DOCKER -i docker_gwbridge -j ACCEPT
--A EFA-DOCKER -j EFA-DOCKER-ALLOW
--A EFA-DOCKER -j DROP
--A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 80 -j ACCEPT
--A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 443 -j ACCEPT"
+:VPS-DOCKER - [0:0]
+:VPS-DOCKER-ALLOW - [0:0]
+-F VPS-DOCKER
+-F VPS-DOCKER-ALLOW
+-A VPS-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+-A VPS-DOCKER -i docker0 -j RETURN
+-A VPS-DOCKER -i br+ -j RETURN
+-A VPS-DOCKER -i docker_gwbridge -j ACCEPT
+-A VPS-DOCKER -j VPS-DOCKER-ALLOW
+-A VPS-DOCKER -j DROP
+-A VPS-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 80 -j ACCEPT
+-A VPS-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 443 -j ACCEPT"
         fi
         printf '%s\n' "$PORT_MARKER_BEGIN"
-        printf '%s\n' '# Gerado a partir de secure-efa-allowed-ports.list; nao edite este bloco.'
+        printf '%s\n' '# Gerado a partir de secure-allowed-ports.list; nao edite este bloco.'
         printf '%s\n' "${rules[@]}"
         printf '%s\n' "$PORT_MARKER_END"
-        [[ "$scope" == "docker" ]] && printf '%s\n' '-A EFA-DOCKER-ALLOW -j RETURN'
+        [[ "$scope" == "docker" ]] && printf '%s\n' '-A VPS-DOCKER-ALLOW -j RETURN'
         printf '%s\n' "COMMIT"
     } > "$file.tmp"
     install -o root -g root -m 0600 "$file.tmp" "$file"
@@ -493,7 +493,7 @@ refresh_ruleset() {
     "$tool"-restore --test --noflush <"$file" || die "Arquivo ${file} falhou no teste de sintaxe."
 
     if [[ "$scope" == "host" ]]; then
-        systemctl reload secure-efa-host-firewall 2>/dev/null || true
+        systemctl reload secure-host-firewall 2>/dev/null || true
         "$tool"-restore --noflush <"$file"
     else
         if service_is_active docker && "$tool" -S DOCKER-USER >/dev/null 2>&1; then
@@ -717,7 +717,7 @@ EOF
 configure_ssh() {
     log INFO "Configurando SSH para root somente por chave."
     write_atomic "$SSH_DROPIN" 0644 <<'EOF'
-# Gerenciado por secure-efa-server.sh.
+# Gerenciado por secure-server.sh.
 Port 22
 AllowUsers root
 PermitRootLogin prohibit-password
@@ -774,27 +774,27 @@ EOF
 render_docker_rules() {
     cat <<'EOF'
 *filter
-:EFA-DOCKER - [0:0]
-:EFA-DOCKER-ALLOW - [0:0]
--F EFA-DOCKER
--F EFA-DOCKER-ALLOW
--A EFA-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
--A EFA-DOCKER -i docker0 -j RETURN
--A EFA-DOCKER -i br+ -j RETURN
--A EFA-DOCKER -i docker_gwbridge -j ACCEPT
--A EFA-DOCKER -j EFA-DOCKER-ALLOW
--A EFA-DOCKER -j DROP
--A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 80 -j ACCEPT
--A EFA-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 443 -j ACCEPT
--A EFA-DOCKER-ALLOW -j RETURN
+:VPS-DOCKER - [0:0]
+:VPS-DOCKER-ALLOW - [0:0]
+-F VPS-DOCKER
+-F VPS-DOCKER-ALLOW
+-A VPS-DOCKER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+-A VPS-DOCKER -i docker0 -j RETURN
+-A VPS-DOCKER -i br+ -j RETURN
+-A VPS-DOCKER -i docker_gwbridge -j ACCEPT
+-A VPS-DOCKER -j VPS-DOCKER-ALLOW
+-A VPS-DOCKER -j DROP
+-A VPS-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 80 -j ACCEPT
+-A VPS-DOCKER-ALLOW -p tcp -m conntrack --ctstate NEW --ctorigdstport 443 -j ACCEPT
+-A VPS-DOCKER-ALLOW -j RETURN
 COMMIT
 EOF
 }
 
 ensure_docker_jump() {
     local tool="$1"
-    while "$tool" -D DOCKER-USER -j EFA-DOCKER 2>/dev/null; do :; done
-    "$tool" -I DOCKER-USER 1 -j EFA-DOCKER
+    while "$tool" -D DOCKER-USER -j VPS-DOCKER 2>/dev/null; do :; done
+    "$tool" -I DOCKER-USER 1 -j VPS-DOCKER
 }
 
 # O NetBird pode substituir o resolv.conf do host por um DNS acessível apenas
@@ -870,7 +870,7 @@ configure_firewall() {
 
     write_atomic "$HOST_UNIT" 0644 <<'UNIT'
 [Unit]
-Description=Secure EFA host firewall
+Description=Secure host firewall
 DefaultDependencies=no
 After=local-fs.target
 Before=network-pre.target docker.service
@@ -879,8 +879,8 @@ Wants=network-pre.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/iptables-restore --noflush /etc/iptables/secure-efa-host.v4
-ExecStart=/usr/sbin/ip6tables-restore --noflush /etc/iptables/secure-efa-host.v6
+ExecStart=/usr/sbin/iptables-restore --noflush /etc/iptables/secure-host.v4
+ExecStart=/usr/sbin/ip6tables-restore --noflush /etc/iptables/secure-host.v6
 
 [Install]
 WantedBy=multi-user.target
@@ -889,11 +889,11 @@ UNIT
     write_atomic "$DOCKER_DROPIN" 0644 <<'UNIT'
 [Service]
 # Docker cria DOCKER-USER; esta configuracao conecta a politica do servidor.
-ExecStartPost=/bin/sh -ec '/usr/sbin/iptables-restore --noflush < /etc/iptables/secure-efa-docker.v4; while /usr/sbin/iptables -D DOCKER-USER -j EFA-DOCKER 2>/dev/null; do :; done; /usr/sbin/iptables -I DOCKER-USER 1 -j EFA-DOCKER; if /usr/sbin/ip6tables -S DOCKER-USER >/dev/null 2>&1; then /usr/sbin/ip6tables-restore --noflush < /etc/iptables/secure-efa-docker.v6; while /usr/sbin/ip6tables -D DOCKER-USER -j EFA-DOCKER 2>/dev/null; do :; done; /usr/sbin/ip6tables -I DOCKER-USER 1 -j EFA-DOCKER; fi'
+ExecStartPost=/bin/sh -ec '/usr/sbin/iptables-restore --noflush < /etc/iptables/secure-docker.v4; while /usr/sbin/iptables -D DOCKER-USER -j VPS-DOCKER 2>/dev/null; do :; done; /usr/sbin/iptables -I DOCKER-USER 1 -j VPS-DOCKER; if /usr/sbin/ip6tables -S DOCKER-USER >/dev/null 2>&1; then /usr/sbin/ip6tables-restore --noflush < /etc/iptables/secure-docker.v6; while /usr/sbin/ip6tables -D DOCKER-USER -j VPS-DOCKER 2>/dev/null; do :; done; /usr/sbin/ip6tables -I DOCKER-USER 1 -j VPS-DOCKER; fi'
 UNIT
 
     systemctl daemon-reload
-    systemctl enable --now secure-efa-host-firewall
+    systemctl enable --now secure-host-firewall
     # install também respeita portas já registradas: o arquivo canônico é a
     # fonte de verdade, inclusive em uma reinstalação do hardening.
     refresh_all host
@@ -908,7 +908,7 @@ configure_fail2ban() {
     log INFO "Configurando Fail2Ban para SSH."
     [[ -f /etc/fail2ban/action.d/iptables-multiport.conf ]] || die "Acao iptables-multiport do Fail2Ban nao foi encontrada."
     write_atomic "$F2B_JAIL" 0644 <<'EOF'
-# Gerenciado por secure-efa-server.sh.
+# Gerenciado por secure-server.sh.
 [sshd]
 enabled = true
 port = 22
@@ -950,8 +950,8 @@ print_report() {
     printf '\n[iptables DOCKER-USER]\n'
     iptables -S DOCKER-USER 2>/dev/null || printf 'Docker ainda nao esta ativo.\n'
     printf '\n[Portas Docker permitidas]\n'
-    iptables -S EFA-DOCKER-ALLOW 2>/dev/null || printf 'Docker ainda nao esta ativo.\n'
-    printf '\nLiberar Docker 5400: sudo iptables -I EFA-DOCKER-ALLOW 1 -p tcp -m conntrack --ctstate NEW --ctorigdstport 5400 -j ACCEPT\n'
+    iptables -S VPS-DOCKER-ALLOW 2>/dev/null || printf 'Docker ainda nao esta ativo.\n'
+    printf '\nLiberar Docker 5400: sudo iptables -I VPS-DOCKER-ALLOW 1 -p tcp -m conntrack --ctstate NEW --ctorigdstport 5400 -j ACCEPT\n'
     printf '\n[Fail2Ban]\n'
     fail2ban-client status sshd
     printf '\nBackup: %s\n' "$BACKUP_DIR"
