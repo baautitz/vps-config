@@ -537,7 +537,8 @@ refresh_ruleset() {
 # sao internas e nao correspondem a trafego vindo da Internet.
 -A INPUT -i docker0 -j ACCEPT
 -A INPUT -i br-+ -j ACCEPT
--A INPUT -i docker_gwbridge -j ACCEPT"
+-A INPUT -i docker_gwbridge -j ACCEPT
+-A INPUT -i wt0 -j ACCEPT"
         if [[ "$family" == "v4" ]]; then
             header+="
 -A INPUT -p icmp -j ACCEPT
@@ -852,6 +853,7 @@ render_host_v4() {
 -A INPUT -i docker0 -j ACCEPT
 -A INPUT -i br-+ -j ACCEPT
 -A INPUT -i docker_gwbridge -j ACCEPT
+-A INPUT -i wt0 -j ACCEPT
 -A INPUT -p icmp -j ACCEPT
 -A INPUT -p udp --sport 67 --dport 68 -j ACCEPT
 -A INPUT -p tcp -m conntrack --ctstate NEW -m multiport --dports 22,80,443 -j ACCEPT
@@ -872,6 +874,7 @@ render_host_v6() {
 -A INPUT -i docker0 -j ACCEPT
 -A INPUT -i br-+ -j ACCEPT
 -A INPUT -i docker_gwbridge -j ACCEPT
+-A INPUT -i wt0 -j ACCEPT
 -A INPUT -p ipv6-icmp -j ACCEPT
 -A INPUT -p udp --sport 547 --dport 546 -j ACCEPT
 -A INPUT -p tcp -m conntrack --ctstate NEW -m multiport --dports 22,80,443 -j ACCEPT

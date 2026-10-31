@@ -202,6 +202,10 @@ host. Para algo que deva ser exclusivo do host, faça-o escutar em `127.0.0.1`
 ou aplique uma política própria.
 
 ## Pontos a monitorar
+
+- **NetBird**: o `INPUT` aceita todo tráfego da interface `wt0`, então restrinja
+  o acesso pelas políticas do painel do NetBird. Isso não foi testado com o
+  NetBird real.
 - **IPv6 desativado no kernel** (`ipv6.disable=1`): as etapas de `ip6tables`
   são ignoradas. Se reativar o IPv6, rode `install` de novo.
 - **Cloud-init / unattended-upgrades** podem reinstalar `ufw` em
