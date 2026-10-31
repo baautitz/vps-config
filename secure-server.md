@@ -1,4 +1,4 @@
-# `secure-server.sh` — hardening para VPS Ubuntu 22.04/24.04
+# `secure-server.sh` — hardening para VPS Ubuntu 22.04/24.04/26.04
 
 Script de hardening "bater e esquecer" para um VPS Ubuntu que serve páginas
 via Docker. Ele aplica três camadas de proteção — SSH, Fail2Ban e iptables —
@@ -20,7 +20,7 @@ políticas do host em cima do Docker.
 
 ## Pré-requisitos
 
-- Ubuntu 22.04 ou 24.04 com `systemd`.
+- Ubuntu 22.04, 24.04 ou 26.04 com `systemd`.
 - Executar como `root` (`sudo ./secure-server.sh`).
 - `/root/.ssh/authorized_keys` válido, com permissões seguras
   (`700` em `/root` e `/root/.ssh`, `600` em `authorized_keys`).

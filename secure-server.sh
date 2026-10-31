@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Hardening simples para Ubuntu 22.04/24.04 com SSH, Fail2Ban e iptables.
+# Hardening simples para Ubuntu 22.04/24.04/26.04 com SSH, Fail2Ban e iptables.
 # Docker continua dono do NAT/publicacao; este script usa DOCKER-USER.
 
 set -Eeuo pipefail
@@ -87,8 +87,8 @@ validate_platform() {
     . /etc/os-release
     [[ "${ID:-}" == ubuntu ]] || die "Sistema nao suportado: esperado Ubuntu."
     case "${VERSION_ID:-}" in
-        22.04|24.04) ;;
-        *) die "Versao nao suportada: use Ubuntu 22.04 ou 24.04." ;;
+        22.04|24.04|26.04) ;;
+        *) die "Versao nao suportada: use Ubuntu 22.04, 24.04 ou 26.04." ;;
     esac
     [[ -d /run/systemd/system ]] || die "O sistema precisa usar systemd."
 }
